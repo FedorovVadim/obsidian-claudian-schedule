@@ -40,6 +40,13 @@
 }
 .cs-preview.cs-ok { color: var(--text-accent); }
 
+.cs-warn {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-warning);
+  line-height: 1.4;
+}
+.cs-warn:empty { display: none; }
+
 .cs-target { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
 .cs-target select { max-width: 240px; }
 
