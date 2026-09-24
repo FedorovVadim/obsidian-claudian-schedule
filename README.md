@@ -52,6 +52,8 @@
 
 ## Установка
 
+Через **BRAT** (на любом Mac с Obsidian): `Add beta plugin` → `FedorovVadim/obsidian-claudian-schedule`.
+
 Для разработки:
 
 ```bash
