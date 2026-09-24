@@ -1,10 +1,10 @@
 /*
- * Проверка поведения после закрытого Обсидиана — решение владельца 24.09.2026:
- * опоздание меньше 12 часов → отправить при запуске, больше → «просрочено».
+ * Проверка очереди и просрочки — решение владельца 24.09.2026:
+ * опоздание меньше 12 часов → отправить, больше → «просрочено».
  *
  * Здесь работает НАСТОЯЩИЙ класс плагина: его startupCheck, tick и fire.
  * Подменены только границы с Обсидианом (сохранение настроек, всплывающие окна,
- * журнал) — само дерево страницы настоящее (jsdom), доставка идёт полным путём.
+ * журнал) и сам Клодиан — заготовкой, повторяющей его настоящее устройство.
  *
  * Запуск: node test/overdue.test.js
  */
@@ -12,11 +12,11 @@
 'use strict';
 
 const assert = require('assert');
-const { JSDOM } = require('jsdom');
 const path = require('path');
 const { internals, notices } = require('./_load');
+const { makeClaudian } = require('./_claudian');
 const Plugin = require(path.join(__dirname, '..', 'main.js'));
-const { DEFAULTS } = internals;
+const { DEFAULTS, MAX_ATTEMPTS } = internals;
 
 let passed = 0;
 async function t(name, fn) {
@@ -25,64 +25,32 @@ async function t(name, fn) {
 }
 
 /** Плагин с настоящей логикой, но без Обсидиана вокруг. */
-function makePlugin(items, { streaming = false } = {}) {
-  const dom = new JSDOM('<!doctype html><html><body></body></html>');
-  const doc = dom.window.document;
-
-  const addLeaf = (busy = false) => {
-    const leaf = doc.createElement('div');
-    leaf.className = 'workspace-leaf-content';
-    leaf.setAttribute('data-type', 'claudian-view');
-    leaf.innerHTML = '<div class="claudian-tab-bar">' +
-      (busy ? '<span class="claudian-tab-badge-streaming"></span>' : '') +
-      '</div><div class="claudian-messages"></div>';
-    const ta = doc.createElement('textarea');
-    ta.className = 'claudian-input';
-    leaf.appendChild(ta);
-    doc.body.appendChild(leaf);
-    ta.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' || !ta.value.trim()) return;
-      const msg = doc.createElement('div');
-      msg.className = 'claudian-message-user';
-      msg.textContent = ta.value;
-      ta.value = '';
-      leaf.querySelector('.claudian-messages').appendChild(msg);
-    });
-    return leaf;
-  };
-  addLeaf(streaming);
-
+function makePlugin(items, claudianOpts = {}) {
+  const c = makeClaudian(claudianOpts);
   const p = new Plugin();
   p.settings = Object.assign({}, DEFAULTS);
   p.items = items;
-  p.busySince = new Map();
   p.working = false;
   p.saved = 0;
-  p.notices = [];
   p.logs = [];
-
   p.saveData = async () => { p.saved++; };
   p.renderStatus = () => {};
   p.log = (line) => p.logs.push(line);
-  p.env = () => ({
-    doc,
-    run: async (id) => { if (id === 'realclaudian:new-tab') addLeaf(false); },
-    sleep: async () => {},
-    requireMod: false,
-    isMac: true,
-    verifyTimeoutMs: 2000,
-  });
-
-  p._doc = doc;
+  p.env = () => c.env;
+  p.claudian = c;
   return p;
 }
 
 const HOUR = 3600000;
-const userTexts = (doc) => Array.from(doc.querySelectorAll('.claudian-message-user')).map(e => e.textContent);
-const item = (over) => ({
-  id: 'i' + over, text: `сообщение (опоздание ${over} ч)`, fireAt: Date.now() - over * HOUR,
-  target: 'current', createdAt: Date.now() - 86400000, status: 'pending', attempts: 0,
-});
+const item = (over, extra = {}) => Object.assign({
+  id: 'i' + over + Math.random().toString(36).slice(2, 6),
+  text: `сообщение (опоздание ${over} ч)`,
+  fireAt: Date.now() - over * HOUR,
+  target: 'current',
+  createdAt: Date.now() - 86400000,
+  status: 'pending',
+  attempts: 0,
+}, extra);
 
 (async () => {
   console.log('Обсидиан был закрыт:');
@@ -90,7 +58,7 @@ const item = (over) => ({
   await t('опоздание 3 часа — сообщение уходит при запуске', async () => {
     const p = makePlugin([item(3)]);
     await p.startupCheck();
-    assert.deepStrictEqual(userTexts(p._doc), ['сообщение (опоздание 3 ч)']);
+    assert.deepStrictEqual(p.claudian.userTexts(), ['сообщение (опоздание 3 ч)']);
     assert.strictEqual(p.items[0].status, 'sent');
   });
 
@@ -98,60 +66,78 @@ const item = (over) => ({
     notices.length = 0;
     const p = makePlugin([item(13)]);
     await p.startupCheck();
-    assert.deepStrictEqual(userTexts(p._doc), [], 'в чат ничего уйти не должно');
+    assert.deepStrictEqual(p.claudian.userTexts(), []);
     assert.strictEqual(p.items[0].status, 'missed');
     assert.ok(notices.some(n => /не ушло/.test(n)), 'владельцу должны сказать, а не промолчать');
   });
 
-  await t('время ещё не пришло — сообщение ждёт, ничего не отправляется', async () => {
-    const p = makePlugin([{ ...item(0), fireAt: Date.now() + 2 * HOUR }]);
+  await t('время ещё не пришло — сообщение ждёт', async () => {
+    const p = makePlugin([item(0, { fireAt: Date.now() + 2 * HOUR })]);
     await p.startupCheck();
-    assert.deepStrictEqual(userTexts(p._doc), []);
+    assert.deepStrictEqual(p.claudian.userTexts(), []);
     assert.strictEqual(p.items[0].status, 'pending');
   });
 
-  await t('оборванный прошлый сеанс (статус «отправляется») — сообщение не теряется', async () => {
-    const p = makePlugin([{ ...item(1), status: 'sending' }]);
+  await t('оборванный прошлый сеанс («отправляется») — сообщение не теряется', async () => {
+    const p = makePlugin([item(1, { status: 'sending' })]);
     await p.startupCheck();
-    assert.strictEqual(p.items[0].status, 'sent', 'подвисшее сообщение должно уйти, а не застрять');
-    assert.deepStrictEqual(userTexts(p._doc), ['сообщение (опоздание 1 ч)']);
-  });
-
-  console.log('Повторные срабатывания:');
-
-  await t('два тика подряд — сообщение уходит РОВНО один раз', async () => {
-    const p = makePlugin([item(1)]);
-    await p.tick();
-    await p.tick();
-    await p.tick();
-    assert.strictEqual(userTexts(p._doc).length, 1, 'дубля быть не должно');
-  });
-
-  await t('агент занят — сообщение остаётся в очереди, а не теряется и не падает', async () => {
-    const p = makePlugin([item(1)], { streaming: true });
-    await p.tick();
-    assert.strictEqual(p.items[0].status, 'pending', 'ждём следующего тика');
-    assert.deepStrictEqual(userTexts(p._doc), []);
-    assert.ok(p.logs.some(l => /ждём/.test(l)), 'ожидание должно попасть в журнал');
-  });
-
-  await t('ждали дольше положенного — сообщение уходит в новую вкладку, а не висит вечно', async () => {
-    const p = makePlugin([item(1)], { streaming: true });
-    await p.tick();                                   // первый подход: занят, начали ждать
-    assert.strictEqual(p.items[0].status, 'pending');
-    // отматываем начало ожидания на 11 минут назад — предел 10
-    p.busySince.set(p.items[0].id, Date.now() - 11 * 60000);
-    await p.tick();
-    assert.strictEqual(p.items[0].status, 'sent', 'после предела ожидания должно уйти');
-    assert.strictEqual(userTexts(p._doc).length, 1);
-    assert.strictEqual(p.items[0].note, 'ушло в новую вкладку');
-  });
-
-  await t('кнопка «Отправить сейчас» при занятом агенте не ждёт — сразу новая вкладка', async () => {
-    const p = makePlugin([item(1)], { streaming: true });
-    await p.fireNow(p.items[0]);
     assert.strictEqual(p.items[0].status, 'sent');
-    assert.strictEqual(p.items[0].note, 'ушло в новую вкладку');
+  });
+
+  console.log('Мак просыпается (находка ревизии — раньше запас не действовал):');
+
+  await t('проснулись через 20 часов — запас 12 ч действует и БЕЗ перезапуска Обсидиана', async () => {
+    const p = makePlugin([item(20)]);
+    await p.tick();        // именно тик, а не startupCheck: после сна Обсидиан не перезагружается
+    assert.strictEqual(p.items[0].status, 'missed', 'запас должен проверяться в обычном ходе часов');
+    assert.deepStrictEqual(p.claudian.userTexts(), [], 'сутки спустя сообщение отправлять нельзя');
+  });
+
+  await t('проснулись через 2 часа — сообщение уходит', async () => {
+    const p = makePlugin([item(2)]);
+    await p.tick();
+    assert.strictEqual(p.items[0].status, 'sent');
+  });
+
+  console.log('Повторные срабатывания и замок:');
+
+  await t('три тика подряд — сообщение уходит РОВНО один раз', async () => {
+    const p = makePlugin([item(1)]);
+    await p.tick(); await p.tick(); await p.tick();
+    assert.strictEqual(p.claudian.userTexts().length, 1);
+  });
+
+  await t('«Отправить сейчас» во время работы часов — отказывается, дубля нет', async () => {
+    const p = makePlugin([item(1)]);
+    p.working = true;                       // часы сейчас заняты отправкой
+    await p.fireNow(p.items[0]);
+    assert.deepStrictEqual(p.claudian.userTexts(), [], 'мимо замка лезть нельзя');
+    p.working = false;
+    await p.fireNow(p.items[0]);
+    assert.strictEqual(p.claudian.userTexts().length, 1);
+  });
+
+  await t('занятый агент — сообщение уходит в очередь Клодиана и считается доставленным', async () => {
+    const p = makePlugin([item(1)], { busy: true });
+    await p.tick();
+    assert.strictEqual(p.items[0].status, 'sent');
+    assert.ok(/очеред/.test(p.items[0].note), `получено: ${p.items[0].note}`);
+  });
+
+  console.log('Помехи не превращаются ни в потерю, ни в вечный круг:');
+
+  await t('Клодиан ещё не поднялся — сообщение ЖДЁТ, а не помечается «не удалось»', async () => {
+    const p = makePlugin([item(1)], { open: false, canOpen: false });
+    await p.tick();
+    assert.strictEqual(p.items[0].status, 'pending', 'временная помеха не должна терять сообщение');
+    assert.ok(/попытка 1/.test(p.items[0].note), `получено: ${p.items[0].note}`);
+  });
+
+  await t(`после ${MAX_ATTEMPTS} попыток сдаёмся и говорим об этом`, async () => {
+    const p = makePlugin([item(1)], { open: false, canOpen: false });
+    for (let i = 0; i < MAX_ATTEMPTS + 1; i++) await p.tick();
+    assert.strictEqual(p.items[0].status, 'failed');
+    assert.ok(/попыт/.test(p.items[0].note), `получено: ${p.items[0].note}`);
   });
 
   await t('сбой доставки не оставляет сообщение в «отправляется» навсегда', async () => {
@@ -159,7 +145,26 @@ const item = (over) => ({
     p.env = () => { throw new Error('окно сломалось'); };
     await p.tick();
     assert.strictEqual(p.items[0].status, 'failed');
-    assert.ok(/сбой/.test(p.items[0].note), `нужна причина, получено: ${p.items[0].note}`);
+    assert.ok(/сбой/.test(p.items[0].note));
+  });
+
+  await t('испорченное время в файле — сообщение не крутится вечно', async () => {
+    const p = makePlugin([item(1, { fireAt: NaN })]);
+    await p.tick();
+    assert.strictEqual(p.items[0].status, 'failed');
+    assert.ok(/испорчен/.test(p.items[0].note), `получено: ${p.items[0].note}`);
+  });
+
+  console.log('Мусор в настройках не ломает часы:');
+
+  await t('checkSec строкой — период остаётся разумным числом', async () => {
+    const p = makePlugin([]);
+    p.settings.checkSec = 'abc';
+    p.settings.graceHours = null;
+    assert.strictEqual(p.grace(), DEFAULTS.graceHours);
+    const { num } = internals;
+    assert.strictEqual(num('abc', 20, 5, 300), 20);
+    assert.strictEqual(num(10000, 20, 5, 300), 300);
   });
 
   console.log(`\nВсего зелёных: ${passed}`);

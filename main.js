@@ -6,11 +6,19 @@
  * Что делает: ты пишешь сообщение сейчас и указываешь время. В назначенный час
  * плагин сам кладёт его в чат Клодиана и отправляет — как будто ты набрал и нажал Enter.
  *
- * Стык с Клодианом — через интерфейс (те же опорные точки, что у Claudian Voice):
- *   - поле ввода:  textarea.claudian-input  внутри .workspace-leaf-content[data-type="claudian-view"]
- *   - переписка:   .claudian-messages → .claudian-message-user
- *   - агент занят: .claudian-tab-badge-streaming
- *   - команды:     realclaudian:open-view, realclaudian:new-tab
+ * Стык с Клодианом (проверено по сборке 2.2.6, 24.09.2026):
+ *   - окна:        app.workspace.getLeavesOfType('claudian-view') — включая оторванные окна
+ *   - вкладка:     .claudian-tab-content (неактивные скрыты классом .claudian-hidden)
+ *   - поле ввода:  textarea.claudian-input внутри вкладки
+ *   - переписка:   [data-role="user"] (класс .claudian-message-user оставлен запасным)
+ *   - очередь:     .claudian-input-queue-row — «⌙ Queued: …», когда агент занят
+ *   - команды:     <id>:open-view, <id>:new-tab, где id ищется среди зарегистрированных
+ *
+ * Чего здесь НЕТ и почему: ожидания занятого агента. Клодиан сам ставит сообщение
+ * в очередь, если в этот момент пишет ответ, и показывает это строкой «⌙ Queued».
+ * Поэтому плагин просто отправляет и различает три исхода: ушло / поставлено в очередь /
+ * не принято. Бейдж вкладки для определения занятости НЕ годится: активная вкладка
+ * получает класс -active, а -streaming достаётся только неактивной.
  *
  * Честное ограничение: плагин живёт внутри Обсидиана. Обсидиан закрыт — никто ничего
  * не отправит. Мак спал — при пробуждении сработает проверка просрочки (запас 12 часов).
@@ -23,16 +31,29 @@ const { Plugin, PluginSettingTab, Setting, Notice, Modal, setIcon, Platform } = 
 // ────────────────────────────────────────────────────────────────────────────
 
 const DEFAULTS = {
-  graceHours: 12,        // опоздание меньше этого — всё равно отправляем при запуске
-  checkSec: 20,          // как часто смотреть на часы
-  busyWaitMin: 10,       // сколько ждать, пока агент допишет ответ
+  graceHours: 12,           // опоздание меньше этого — всё равно отправляем при запуске
+  checkSec: 20,             // как часто смотреть на часы
   defaultTarget: 'current', // 'current' — в открытую вкладку, 'new' — в новую
-  notify: true,          // показывать всплывающие уведомления об отправке
-  keepDays: 14,          // сколько дней держать историю отправленных
-  writeLog: true,        // вести schedule.log рядом с плагином
+  notify: true,             // показывать всплывающие уведомления об отправке
+  keepDays: 14,             // сколько дней держать историю отправленных
+  writeLog: true,           // вести schedule.log рядом с плагином
 };
 
 const PLUGIN_ID = 'claudian-schedule';
+const MAX_ATTEMPTS = 20;        // ≈ 7 минут попыток при тике в 20 секунд
+const FIVE_YEARS_MS = 5 * 365 * 86400000;
+
+/**
+ * Число из настроек может оказаться мусором после ручной правки data.json.
+ * Пустоту и «да/нет» берём за «значения нет» — иначе Number(null) = 0 молча
+ * превратится в минимум и настройка станет не той, что человек задавал.
+ */
+function num(value, fallback, min, max) {
+  if (value === null || value === undefined || value === '' || typeof value === 'boolean') return fallback;
+  const n = Number(value);
+  if (!isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Чистые функции: время. Ничего не знают про Обсидиан — проверяются тестами.
@@ -40,12 +61,33 @@ const PLUGIN_ID = 'claudian-schedule';
 
 const pad = (n) => String(n).padStart(2, '0');
 
+/** Собрать дату с проверкой: 31.02 и 25:00 должны отвергаться, а не «переползать». */
+function buildDate(year, month, day, hh, mm) {
+  if (!(month >= 1 && month <= 12)) return null;
+  if (!(day >= 1 && day <= 31)) return null;
+  if (!(hh >= 0 && hh <= 23)) return null;
+  if (!(mm >= 0 && mm <= 59)) return null;
+  const d = new Date(year, month - 1, day, hh, mm, 0, 0);
+  // 31.02 превратилось бы в 03.03 — такую дату не принимаем
+  if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) return null;
+  return d;
+}
+
+function finishDate(d, now) {
+  const at = d instanceof Date ? d.getTime() : Number(d);
+  if (!isFinite(at)) return { error: 'не понял дату' };
+  if (at <= now) return { error: 'это время уже прошло' };
+  if (at > now + FIVE_YEARS_MS) return { error: 'слишком далеко: дальше пяти лет не планируем' };
+  return { at };
+}
+
 /**
  * Разбор написанного человеком времени.
  * Возвращает { at: миллисекунды } или { error: 'причина по-русски' }.
  *
  * Молчаливого «ноля» быть не должно: непонятный ввод — это ошибка с причиной,
- * а не «отправлю прямо сейчас» (§🤐 v3.35).
+ * а не «отправлю прямо сейчас» (§🤐 v3.35). Все ветки выходят через finishDate,
+ * поэтому NaN и бессмысленные даты наружу не попадают.
  */
 function parseWhen(raw, now = Date.now()) {
   const s = String(raw == null ? '' : raw).trim().toLowerCase().replace(/\s+/g, ' ');
@@ -63,7 +105,7 @@ function parseWhen(raw, now = Date.now()) {
     else if (/^сек|^с$/.test(unit)) mult = 1000;
     if (!mult) return { error: 'не понял единицу: пиши «минут», «часов» или «дней»' };
     if (!(n > 0)) return { error: 'сколько именно? число должно быть больше нуля' };
-    return { at: Math.round(now + n * mult) };
+    return finishDate(now + n * mult, now);
   }
 
   // ── день словом: «сегодня 18:00», «завтра в 9», «послезавтра 7:30» ──
@@ -80,9 +122,10 @@ function parseWhen(raw, now = Date.now()) {
 
   // ── дата: «24.09 18:30», «24.09.2026 18:30», «2026-09-24 18:30» ──
   if (dayShift === null) {
-    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ t](\d{1,2})(?:[:.](\d{2}))?)?$/);
+    const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ t](\d{1,2})(?:[:.](\d{2}))?)?$/);
     if (iso) {
-      const d = new Date(+iso[1], +iso[2] - 1, +iso[3], iso[4] ? +iso[4] : 9, iso[5] ? +iso[5] : 0, 0, 0);
+      const d = buildDate(+iso[1], +iso[2], +iso[3], iso[4] ? +iso[4] : 9, iso[5] ? +iso[5] : 0);
+      if (!d) return { error: 'такой даты не бывает' };
       return finishDate(d, now);
     }
     const ru = s.match(/^(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?:\s*(?:в\s*)?(\d{1,2})(?:[:.](\d{2}))?)?$/);
@@ -90,8 +133,15 @@ function parseWhen(raw, now = Date.now()) {
       const nowD = new Date(now);
       let year = ru[3] ? +ru[3] : nowD.getFullYear();
       if (year < 100) year += 2000;
-      const d = new Date(year, +ru[2] - 1, +ru[1], ru[4] ? +ru[4] : 9, ru[5] ? +ru[5] : 0, 0, 0);
-      if (!ru[3] && d.getTime() < now) d.setFullYear(year + 1); // «31.12» в январе — это конец года, а не прошлый
+      const hh = ru[4] ? +ru[4] : 9;
+      const mm = ru[5] ? +ru[5] : 0;
+      let d = buildDate(year, +ru[2], +ru[1], hh, mm);
+      if (!d) return { error: 'такой даты не бывает' };
+      // «31.12» в январе — это конец года, а не прошедший декабрь
+      if (!ru[3] && d.getTime() < now) {
+        d = buildDate(year + 1, +ru[2], +ru[1], hh, mm);
+        if (!d) return { error: 'такой даты не бывает' };
+      }
       return finishDate(d, now);
     }
   }
@@ -101,22 +151,19 @@ function parseWhen(raw, now = Date.now()) {
   if (t) {
     const hh = +t[1];
     const mm = t[2] ? +t[2] : 0;
-    if (hh > 23 || mm > 59) return { error: 'такого времени не бывает: часы 0-23, минуты 0-59' };
     const base = new Date(now);
-    const d = new Date(base.getFullYear(), base.getMonth(), base.getDate() + (dayShift || 0), hh, mm, 0, 0);
+    let d = buildDate(base.getFullYear(), base.getMonth() + 1, base.getDate() + (dayShift || 0), hh, mm);
+    if (!d) {
+      // выход за край месяца: «послезавтра» 30-го числа
+      if (hh > 23 || mm > 59) return { error: 'такого времени не бывает: часы 0-23, минуты 0-59' };
+      d = new Date(base.getFullYear(), base.getMonth(), base.getDate() + (dayShift || 0), hh, mm, 0, 0);
+    }
     // «18:00», когда уже 19:00 и день не назван словом → значит завтра, а не в прошлое
-    if (dayShift === null && d.getTime() <= now) d.setDate(d.getDate() + 1);
+    if (dayShift === null && d.getTime() <= now) d = new Date(d.getTime() + 86400000);
     return finishDate(d, now);
   }
 
   return { error: 'не понял время. Примеры: «через 30 минут», «сегодня 18:00», «завтра 9:00», «24.09 18:30»' };
-}
-
-function finishDate(d, now) {
-  const at = d.getTime();
-  if (!isFinite(at)) return { error: 'не понял дату' };
-  if (at <= now) return { error: 'это время уже прошло' };
-  return { at };
 }
 
 const sameDay = (a, b) =>
@@ -124,6 +171,7 @@ const sameDay = (a, b) =>
 
 /** «сегодня в 18:00» / «завтра в 09:00» / «26.09 в 18:30» */
 function formatWhen(at, now = Date.now()) {
+  if (!isFinite(at)) return 'время не разобрано';
   const d = new Date(at);
   const n = new Date(now);
   const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -135,6 +183,7 @@ function formatWhen(at, now = Date.now()) {
 
 /** «через 5 мин» / «через 2 ч 10 мин» / «40 мин назад» */
 function humanLeft(at, now = Date.now()) {
+  if (!isFinite(at)) return 'срок не разобран';
   const diff = at - now;
   const past = diff < 0;
   const min = Math.round(Math.abs(diff) / 60000);
@@ -152,11 +201,12 @@ function humanLeft(at, now = Date.now()) {
 }
 
 /**
- * Что делать с сообщением, время которого уже прошло (мы были выключены).
+ * Что делать с сообщением, время которого уже прошло (мы были выключены или спали).
  * Решение владельца 24.09.2026: опоздание меньше запаса — отправляем, больше — «просрочено».
  */
 function decideOverdue(item, now, graceHours) {
   const lateMs = now - item.fireAt;
+  if (!isFinite(lateMs)) return 'broken';
   if (lateMs < 0) return 'wait';
   if (lateMs <= graceHours * 3600000) return 'send';
   return 'miss';
@@ -168,72 +218,110 @@ function shortText(text, limit = 70) {
   return one.length > limit ? one.slice(0, limit - 1) + '…' : one;
 }
 
+const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
 // ────────────────────────────────────────────────────────────────────────────
-// Работа с окном Клодиана. Функции берут документ извне — их можно проверить
-// на настоящем дереве страницы (jsdom), а не на самодельной заглушке (§🧫 v3.34).
+// Работа с окнами Клодиана.
+// Функции получают корни окон извне, поэтому проверяются на настоящем дереве
+// страницы (jsdom), а не на самодельной заглушке (§🧫 v3.34).
 // ────────────────────────────────────────────────────────────────────────────
 
 const SEL = {
   leaf: '.workspace-leaf-content[data-type="claudian-view"]',
+  tab: '.claudian-tab-content',
   input: 'textarea.claudian-input',
-  messages: '.claudian-messages',
-  userMsg: '.claudian-message-user',
-  streaming: '.claudian-tab-badge-streaming',
+  userMsg: '[data-role="user"], .claudian-message-user',
+  queue: '.claudian-input-queue-row',
   toolbar: '.claudian-input-toolbar',
+  hiddenCls: 'claudian-hidden',
 };
 
-/** Есть ли в документе раскладка (в тестовой среде её нет — там размеры всегда нулевые). */
+/** Есть ли в документе раскладка (в тестовой среде её нет — размеры всегда нулевые). */
 function hasLayout(doc) {
   const b = doc && doc.body;
   return !!(b && b.getClientRects && b.getClientRects().length);
 }
 
-function isVisible(el) {
-  if (!el) return false;
-  if (hasLayout(el.ownerDocument)) return !!(el.getClientRects && el.getClientRects().length);
+/** Спрятан ли элемент явно — классом Клодиана, стилем или атрибутом. */
+function isHiddenEl(el) {
   for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    if (n.classList && n.classList.contains(SEL.hiddenCls)) return true;
     const st = (n.getAttribute && n.getAttribute('style')) || '';
-    if (/display\s*:\s*none/.test(st) || /visibility\s*:\s*hidden/.test(st)) return false;
-    if (n.hasAttribute && n.hasAttribute('hidden')) return false;
+    if (/display\s*:\s*none/.test(st) || /visibility\s*:\s*hidden/.test(st)) return true;
+    if (n.hasAttribute && n.hasAttribute('hidden')) return true;
   }
+  return false;
+}
+
+/** Виден ли элемент человеку. */
+function isUsable(el) {
+  if (!el) return false;
+  if (isHiddenEl(el)) return false;
+  if (hasLayout(el.ownerDocument)) return !!(el.getClientRects && el.getClientRects().length);
   return true;
 }
 
-/** Видимое поле ввода Клодиана (или null, если окна нет). */
-function findInput(doc) {
-  const list = doc.querySelectorAll(`${SEL.leaf} ${SEL.input}`);
-  for (const el of list) if (isVisible(el)) return el;
+function collect(roots, selector) {
+  const out = [];
+  for (const root of roots || []) {
+    if (!root || !root.querySelectorAll) continue;
+    for (const el of root.querySelectorAll(selector)) out.push(el);
+  }
+  return out;
+}
+
+/** Поле ввода активной вкладки Клодиана. */
+function activeInput(roots) {
+  for (const el of collect(roots, SEL.input)) if (isUsable(el)) return el;
   return null;
 }
 
 /**
  * Свободное поле ввода — им пользуемся после открытия новой вкладки.
- *
- * Свободное значит: видимое, пустое (чужой черновик не трогаем) и в невнятой вкладке
- * (агент там не печатает). Идём с конца: новая вкладка добавляется последней, а если
- * открыты две панели рядом, первой в списке может оказаться как раз занятая.
+ * Свободное значит: видимое и пустое (чужой черновик не трогаем).
+ * Идём с конца: новая вкладка добавляется последней.
  */
-function findEmptyInput(doc) {
-  const list = Array.from(doc.querySelectorAll(`${SEL.leaf} ${SEL.input}`)).reverse();
-  for (const el of list) {
-    if (!isVisible(el)) continue;
-    if ((el.value || '').trim()) continue;
-    if (isStreaming(doc, el)) continue;
-    return el;
-  }
+function freeInput(roots) {
+  const list = collect(roots, SEL.input).reverse();
+  for (const el of list) if (isUsable(el) && !(el.value || '').trim()) return el;
   return null;
 }
 
-/** Агент сейчас печатает ответ? */
-function isStreaming(doc, input) {
-  const scope = (input && input.closest && input.closest('.workspace-leaf-content')) || doc;
-  return !!scope.querySelector(SEL.streaming);
+/** Вкладка, которой принадлежит поле ввода. Сообщения соседних вкладок лежат рядом в DOM. */
+function tabOf(input) {
+  if (!input) return null;
+  return (input.closest && (input.closest(SEL.tab) || input.closest(SEL.leaf))) || input.ownerDocument;
 }
 
-/** Сколько сообщений от пользователя в этой вкладке — по ним проверяем, что отправка состоялась. */
-function countUserMessages(doc, input) {
-  const scope = (input && input.closest && input.closest('.workspace-leaf-content')) || doc;
-  return scope.querySelectorAll(SEL.userMsg).length;
+function countUserMessages(input) {
+  const tab = tabOf(input);
+  return tab ? tab.querySelectorAll(SEL.userMsg).length : 0;
+}
+
+function queueText(input) {
+  const tab = tabOf(input);
+  const q = tab && tab.querySelector(SEL.queue);
+  return q ? norm(q.textContent) : '';
+}
+
+/**
+ * Чем кончилась отправка. Три исхода:
+ *   'отправлено'  — сообщение появилось в переписке;
+ *   'в очереди'   — Клодиан был занят и поставил его в очередь («⌙ Queued»), ответит следом;
+ *   null          — ничего не произошло.
+ */
+function sendOutcome(input, text, before) {
+  const chunk = norm(text).slice(0, 24);
+  const tab = tabOf(input);
+  if (!tab) return null;
+
+  const users = tab.querySelectorAll(SEL.userMsg);
+  if (users.length > before) {
+    const last = norm(users[users.length - 1].textContent);
+    if (!chunk || last.includes(chunk)) return 'отправлено';
+  }
+  if (chunk && queueText(input).includes(chunk)) return 'в очереди у Клодиана — ответит следом';
+  return null;
 }
 
 /** Нажатие Enter так, как его ждёт Клодиан (с Cmd/Ctrl, если так настроено). */
@@ -246,83 +334,94 @@ function pressEnter(input, withMod, isMac) {
   }));
 }
 
+function fireInput(el) {
+  const win = (el.ownerDocument && el.ownerDocument.defaultView) || globalThis;
+  el.dispatchEvent(new win.Event('input', { bubbles: true }));
+}
+
 /**
  * Доставка сообщения в чат.
  *
  * env = {
- *   doc,                       документ страницы
- *   run(commandId),            выполнить команду Обсидиана
- *   sleep(ms),                 подождать
- *   requireMod,                у Клодиана отправка на Cmd/Ctrl+Enter
+ *   roots(),                 корни окон Клодиана (учитывая оторванные окна)
+ *   run(suffix),             выполнить команду Клодиана: 'open-view' | 'new-tab'; false = не вышло
+ *   sleep(ms),
+ *   requireMod, modKnown,    настройка «отправка на Cmd/Ctrl+Enter» и удалось ли её прочитать
  *   isMac,
- *   verifyTimeoutMs            сколько ждать подтверждения отправки
+ *   verifyTimeoutMs
  * }
  *
- * Возвращает { ok, via, reason }. ok=false при retry=true означает «занят, попробуй позже».
+ * { ok: true, via, note } — ушло; { ok: false, retry, reason } — помеха; { ok: false, reason } — отказ.
  */
 async function deliverText(env, text, target) {
-  const { doc, run, sleep } = env;
-  const verifyTimeoutMs = env.verifyTimeoutMs == null ? 6000 : env.verifyTimeoutMs;
+  const sleep = env.sleep;
+  const verifyTimeoutMs = env.verifyTimeoutMs == null ? 8000 : env.verifyTimeoutMs;
 
-  let input = findInput(doc);
+  let input = activeInput(env.roots());
 
-  // 1. Окно Клодиана закрыто — открываем сами
+  // 1. Окно Клодиана закрыто — открываем сами. Не вышло — это помеха, а не отказ:
+  //    Клодиан мог ещё не прогрузиться после запуска Обсидиана.
   if (!input) {
-    await run('realclaudian:open-view');
+    const opened = await env.run('open-view');
     await sleep(800);
-    input = findInput(doc);
-    if (!input) return { ok: false, reason: 'окно Клодиана не открылось' };
+    input = activeInput(env.roots());
+    if (!input) {
+      return { ok: false, retry: true, reason: opened === false ? 'Клодиан не откликнулся на команду открытия' : 'окно Клодиана ещё не открылось' };
+    }
   }
 
-  // 2. Куда класть.
+  // 2. Куда класть. В поле есть черновик — не трогаем его, уходим в новую вкладку.
   let via = target === 'new' ? 'new' : 'current';
+  if (via === 'current' && (input.value || '').trim()) via = 'new';
 
-  if (via === 'current') {
-    // Агент печатает в этой вкладке — не встреваем, вернёмся позже
-    if (isStreaming(doc, input)) return { ok: false, retry: true, reason: 'агент печатает ответ' };
-    // В поле набран черновик — не трогаем его, уходим в новую вкладку
-    if ((input.value || '').trim()) via = 'new';
-  }
-
+  let viaNote = '';
   if (via === 'new') {
-    await run('realclaudian:new-tab');
+    const opened = await env.run('new-tab');
     await sleep(800);
-    const fresh = findEmptyInput(doc);
-    // Пустого поля нет — значит вкладка не открылась (или там тоже черновик).
-    // Это временная помеха, а не отказ: вернёмся на следующем тике.
-    if (!fresh) return { ok: false, retry: true, reason: 'новая вкладка не открылась' };
+    const fresh = freeInput(env.roots());
+    if (!fresh) {
+      // свободного поля нет: либо вкладка не открылась, либо везде чужие черновики.
+      // Это помеха, а не отказ — вернёмся на следующем тике.
+      return {
+        ok: false, retry: true,
+        reason: opened === false ? 'Клодиан не дал открыть новую вкладку' : 'новая вкладка не открылась',
+      };
+    }
+    // Вкладку открыть не вышло (у Клодиана есть предел), но есть свободное поле —
+    // лучше доставить туда и сказать об этом, чем молча держать сообщение.
+    if (opened === false) viaNote = 'новую вкладку открыть не вышло, положил в свободную';
     input = fresh;
-    // В новой вкладке агент свободен; если вдруг нет — ждём дальше
-    if (isStreaming(doc, input)) return { ok: false, retry: true, reason: 'агент печатает ответ' };
   }
 
-  // 4. Вставляем и отправляем
-  const before = countUserMessages(doc, input);
-  const win = (doc.defaultView || globalThis);
+  // 3. Вставляем и отправляем
+  const before = countUserMessages(input);
   input.value = text;
-  input.dispatchEvent(new win.Event('input', { bubbles: true }));
+  fireInput(input);
   if (input.focus) input.focus();
   pressEnter(input, env.requireMod, env.isMac);
 
-  // 5. Проверяем ИСХОД, а не попытку: поле опустело и в переписке прибавилось
-  //    сообщение от пользователя (§🎯 v2.85, §👁 v3.16).
+  // 4. Проверяем ИСХОД, а не попытку (§🎯 v2.85, §👁 v3.16).
+  //    Повторное нажатие — только если настройку прочитать не удалось И поле не тронуто:
+  //    у Клодиана при выключенном «Cmd+Enter» проходят ОБА нажатия, и вслепую
+  //    подстрахованное второе отправляет сообщение дважды.
   const step = 200;
   let waited = 0;
-  let triedMod = !!env.requireMod;
+  let repressed = env.modKnown === true;
   while (waited < verifyTimeoutMs) {
-    const emptied = !(input.value || '').trim();
-    const grew = countUserMessages(doc, input) > before;
-    if (emptied && grew) return { ok: true, via };
-    // страховка: часть сборок Клодиана ждёт Cmd/Ctrl+Enter
-    if (!triedMod && waited >= 400) { pressEnter(input, true, env.isMac); triedMod = true; }
+    const outcome = sendOutcome(input, text, before);
+    if (outcome) return { ok: true, via, note: viaNote ? `${viaNote}, ${outcome}` : outcome };
+    if (!repressed && waited >= 1500 && (input.value || '') === text) {
+      pressEnter(input, !env.requireMod, env.isMac);
+      repressed = true;
+    }
     await sleep(step);
     waited += step;
   }
 
-  // Не ушло — возвращаем поле как было, чтобы не оставлять мусор
+  // 5. Не ушло — убираем свой текст, чтобы не оставлять мусор в поле
   if ((input.value || '') === text) {
     input.value = '';
-    input.dispatchEvent(new win.Event('input', { bubbles: true }));
+    fireInput(input);
   }
   return { ok: false, reason: 'Клодиан не принял сообщение (в переписке оно не появилось)' };
 }
@@ -335,8 +434,7 @@ class ClaudianSchedulePlugin extends Plugin {
   async onload() {
     await this.loadState();
 
-    this.busySince = new Map();   // id → когда впервые увидели «агент занят»
-    this.working = false;         // чтобы тик не наступал сам себе на пятки
+    this.working = false;         // один заход отправки за раз
     this.buttons = new Set();
 
     this.addCommand({
@@ -362,20 +460,29 @@ class ClaudianSchedulePlugin extends Plugin {
 
     this.addSettingTab(new ScheduleSettingsTab(this.app, this));
 
-    // Тик по часам + подсадка кнопки в панель Клодиана
-    this.registerInterval(window.setInterval(() => this.tick(), Math.max(5, this.settings.checkSec) * 1000));
+    this.restartTimer();
     this.registerInterval(window.setInterval(() => this.mountButtons(), 2000));
 
     // Проверка просрочки — когда интерфейс уже собран, иначе окна Клодиана ещё нет
     this.app.workspace.onLayoutReady(() => {
-      window.setTimeout(() => this.startupCheck(), 3000);
+      const h = window.setTimeout(() => this.startupCheck(), 3000);
+      this.register(() => window.clearTimeout(h));
       this.mountButtons();
     });
   }
 
   onunload() {
+    if (this.tickHandle) window.clearInterval(this.tickHandle);
     this.buttons.forEach(b => b.remove());
     this.buttons.clear();
+  }
+
+  /** Часы пересоздаём при смене настройки — иначе ползунок не действует до перезапуска. */
+  restartTimer() {
+    if (this.tickHandle) window.clearInterval(this.tickHandle);
+    const sec = num(this.settings.checkSec, DEFAULTS.checkSec, 5, 300);
+    this.tickHandle = window.setInterval(() => this.tick(), sec * 1000);
+    this.registerInterval(this.tickHandle);
   }
 
   // ── Состояние ────────────────────────────────────────────────────────────
@@ -390,6 +497,8 @@ class ClaudianSchedulePlugin extends Plugin {
     await this.saveData({ settings: this.settings, items: this.items });
     this.renderStatus();
   }
+
+  grace() { return num(this.settings.graceHours, DEFAULTS.graceHours, 1, 48); }
 
   pending() {
     return this.items.filter(i => i.status === 'pending' || i.status === 'sending')
@@ -424,7 +533,7 @@ class ClaudianSchedulePlugin extends Plugin {
 
   /** Подчистка старой истории, чтобы файл не рос вечно. */
   async prune() {
-    const edge = Date.now() - this.settings.keepDays * 86400000;
+    const edge = Date.now() - num(this.settings.keepDays, DEFAULTS.keepDays, 1, 365) * 86400000;
     const before = this.items.length;
     this.items = this.items.filter(i =>
       i.status === 'pending' || i.status === 'sending' || (i.sentAt || i.fireAt) > edge);
@@ -433,39 +542,51 @@ class ClaudianSchedulePlugin extends Plugin {
 
   // ── Часы ─────────────────────────────────────────────────────────────────
 
-  /** Проверка при запуске: что мы проспали, пока Обсидиан был закрыт. */
+  /** Запуск Обсидиана: подчистить историю и сразу проверить, что проспали. */
   async startupCheck() {
-    const now = Date.now();
-    const missed = [];
-    for (const item of this.items) {
-      if (item.status !== 'pending' && item.status !== 'sending') continue;
-      if (item.status === 'sending') item.status = 'pending'; // обрыв прошлого сеанса
-      const what = decideOverdue(item, now, this.settings.graceHours);
-      if (what === 'miss') {
-        item.status = 'missed';
-        item.note = `Обсидиан был закрыт, опоздание ${humanLeft(item.fireAt, now)}`;
-        missed.push(item);
-        this.log(`просрочено | ${formatWhen(item.fireAt, now)} | «${shortText(item.text, 50)}»`);
-      }
-    }
-    if (missed.length) {
-      await this.save();
-      new Notice(
-        `Отложенные сообщения: ${missed.length} не ушло — опоздание больше ${this.settings.graceHours} ч. ` +
-        `Открой список, чтобы отправить или удалить.`, 10000);
-    }
     await this.prune();
-    await this.tick();   // ждём именно отправку: иначе «проверил просрочку» ≠ «сообщение ушло»
+    await this.tick();
   }
 
+  /**
+   * Один заход часов: разобраться с просрочкой и отправить, чему пришло время.
+   * Просрочка проверяется ЗДЕСЬ, а не только при запуске: после сна Мака Обсидиан
+   * не перезагружается, работает только этот тик.
+   */
   async tick() {
     if (this.working) return;
-    const now = Date.now();
-    const due = this.pending().filter(i => i.fireAt <= now);
-    if (!due.length) { this.renderStatus(); return; }
-
     this.working = true;
     try {
+      const now = Date.now();
+      const grace = this.grace();
+      const missed = [];
+      let changed = false;
+
+      for (const item of this.items) {
+        if (item.status !== 'pending' && item.status !== 'sending') continue;
+        if (item.status === 'sending') { item.status = 'pending'; changed = true; } // обрыв прошлого сеанса
+        const what = decideOverdue(item, now, grace);
+        if (what === 'broken') {
+          item.status = 'failed';
+          item.note = 'время сообщения испорчено — задай его заново';
+          item.sentAt = now;
+          changed = true;
+        } else if (what === 'miss') {
+          item.status = 'missed';
+          item.note = `Обсидиан был закрыт, опоздание ${humanLeft(item.fireAt, now)}`;
+          missed.push(item);
+          changed = true;
+          this.log(`просрочено | ${formatWhen(item.fireAt, now)} | «${shortText(item.text, 50)}»`);
+        }
+      }
+      if (changed) await this.save();
+      if (missed.length) {
+        new Notice(
+          `Отложенные сообщения: ${missed.length} не ушло — опоздание больше ${grace} ч. ` +
+          `Открой список, чтобы отправить или удалить.`, 10000);
+      }
+
+      const due = this.pending().filter(i => i.fireAt <= now);
       for (const item of due) await this.fire(item, now);
     } finally {
       this.working = false;
@@ -473,77 +594,108 @@ class ClaudianSchedulePlugin extends Plugin {
     }
   }
 
-  /**
-   * Отправка одного сообщения.
-   * force = «не ждать освободившегося агента» (кнопка «Отправить сейчас»).
-   */
-  async fire(item, now = Date.now(), force = false) {
+  /** Отправка одного сообщения. Вызывается только из tick() и fireNow() — оба под замком. */
+  async fire(item, now = Date.now()) {
     item.status = 'sending';
     item.attempts = (item.attempts || 0) + 1;
     await this.save();
 
-    // Сколько уже ждём освобождения агента по этому сообщению
-    const waitedFrom = this.busySince.has(item.id) ? this.busySince.get(item.id) : now;
-    const waitedTooLong = (now - waitedFrom) / 60000 >= this.settings.busyWaitMin;
-
     // Любая неожиданная поломка не должна оставить сообщение навсегда в «отправляется»
     let res;
     try {
-      const env = this.env();
-      res = await deliverText(env, item.text, item.target);
-      // Агент занят, а ждать больше нельзя — уходим в новую вкладку, там он свободен
-      if (!res.ok && res.retry && (force || waitedTooLong)) {
-        res = await deliverText(env, item.text, 'new');
-      }
+      res = await deliverText(this.env(), item.text, item.target);
     } catch (e) {
       res = { ok: false, reason: `сбой при отправке: ${e && e.message ? e.message : e}` };
       console.error('[claudian-schedule] сбой доставки:', e);
     }
 
     if (res.ok) {
-      this.busySince.delete(item.id);
       item.status = 'sent';
       item.sentAt = Date.now();
-      item.note = res.via === 'new' ? 'ушло в новую вкладку' : 'ушло в открытую вкладку';
+      item.note = res.via === 'new' ? `новая вкладка, ${res.note}` : res.note;
       await this.save();
       this.log(`отправлено | ${item.note} | «${shortText(item.text, 50)}»`);
       if (this.settings.notify) new Notice(`Клодиану отправлено: «${shortText(item.text, 60)}»`, 6000);
       return;
     }
 
-    if (res.retry) {
-      if (!this.busySince.has(item.id)) this.busySince.set(item.id, now);
-      item.status = 'pending';       // вернёмся на следующем тике
-      item.note = res.reason;
+    // Помеха — вернёмся на следующем тике, но не бесконечно
+    if (res.retry && item.attempts < MAX_ATTEMPTS) {
+      item.status = 'pending';
+      item.note = `${res.reason} — попытка ${item.attempts} из ${MAX_ATTEMPTS}`;
       await this.save();
-      this.log(`ждём | ${res.reason} | «${shortText(item.text, 50)}»`);
+      this.log(`ждём | ${res.reason} | попытка ${item.attempts} | «${shortText(item.text, 50)}»`);
       return;
     }
 
     item.status = 'failed';
-    item.note = res.reason || 'не удалось отправить';
+    item.note = res.retry
+      ? `не вышло за ${item.attempts} попыток: ${res.reason}`
+      : (res.reason || 'не удалось отправить');
     item.sentAt = Date.now();
     await this.save();
     this.log(`НЕ УДАЛОСЬ | ${item.note} | «${shortText(item.text, 50)}»`);
     new Notice(`Отложенное сообщение не ушло: ${item.note}`, 12000);
   }
 
-  /** Отправить прямо сейчас (кнопка в списке) — занятого агента не ждём. */
+  /** Отправить прямо сейчас (кнопка в списке) — под тем же замком, что и часы. */
   async fireNow(item) {
-    await this.fire(item, Date.now(), true);
+    if (this.working) { new Notice('Сейчас идёт отправка — подожди пару секунд'); return; }
+    this.working = true;
+    try {
+      item.status = 'pending';
+      item.attempts = 0;
+      await this.fire(item, Date.now());
+    } finally {
+      this.working = false;
+      this.renderStatus();
+    }
+  }
+
+  // ── Стык с Клодианом ─────────────────────────────────────────────────────
+
+  /** Корни всех окон Клодиана, включая оторванные в отдельное окно. */
+  claudianRoots() {
+    let roots = [];
+    try {
+      const leaves = this.app.workspace.getLeavesOfType('claudian-view') || [];
+      roots = leaves.map(l => l && l.view && l.view.containerEl).filter(Boolean);
+    } catch (e) { /* ниже запасной путь */ }
+    return roots.length ? roots : [document];
+  }
+
+  /**
+   * Команда Клодиана по окончанию имени. Id зашивать нельзя: наш Клодиан — форк
+   * (`realclaudian`), апстрим живёт под `claudian`.
+   * Возвращает false, если команда не найдена или отказалась выполняться.
+   */
+  runClaudianCommand(suffix) {
+    try {
+      const all = this.app.commands.commands || {};
+      const id = [`realclaudian:${suffix}`, `claudian:${suffix}`].find(x => all[x])
+        || Object.keys(all).find(x => x.endsWith(`:${suffix}`) && /claudian/i.test(x));
+      if (!id) return false;
+      return this.app.commands.executeCommandById(id) !== false;
+    } catch (e) {
+      console.warn('[claudian-schedule] команда Клодиана не выполнилась:', e);
+      return false;
+    }
   }
 
   env() {
     let requireMod = false;
+    let modKnown = false;
     try {
-      const rc = this.app.plugins.plugins['realclaudian'];
-      requireMod = !!(rc && rc.settings && rc.settings.requireCommandOrControlEnterToSend);
-    } catch (e) { /* настройка недоступна — шлём обычный Enter, дальше сработает страховка */ }
+      const rc = this.app.plugins.plugins['realclaudian'] || this.app.plugins.plugins['claudian'];
+      const v = rc && rc.settings && rc.settings.requireCommandOrControlEnterToSend;
+      if (typeof v === 'boolean') { requireMod = v; modKnown = true; }
+    } catch (e) { /* не прочитали — подстрахуемся вторым нажатием */ }
     return {
-      doc: document,
-      run: (id) => this.app.commands.executeCommandById(id),
+      roots: () => this.claudianRoots(),
+      run: (suffix) => this.runClaudianCommand(suffix),
       sleep: (ms) => new Promise(r => window.setTimeout(r, ms)),
       requireMod,
+      modKnown,
       isMac: typeof Platform !== 'undefined' ? !!Platform.isMacOS : true,
     };
   }
@@ -564,8 +716,7 @@ class ClaudianSchedulePlugin extends Plugin {
     // Клодиан пересобирает панель при переключении вкладок — выбрасываем из учёта
     // кнопки, которых уже нет на странице, иначе список растёт всю сессию
     this.buttons.forEach(b => { if (!b.isConnected) this.buttons.delete(b); });
-    const toolbars = document.querySelectorAll(SEL.toolbar);
-    toolbars.forEach(tb => {
+    collect(this.claudianRoots(), SEL.toolbar).forEach(tb => {
       if (tb.querySelector('.cs-clock-btn')) return;
       const btn = tb.createEl('button', { cls: 'cs-clock-btn clickable-icon' });
       btn.setAttribute('aria-label', 'Отложить сообщение на время');
@@ -580,12 +731,12 @@ class ClaudianSchedulePlugin extends Plugin {
   }
 
   composeFromInput() {
-    const input = findInput(document);
+    const input = activeInput(this.claudianRoots());
     const text = input ? input.value : '';
     this.openComposer(text, () => {
       if (!input) return;
       input.value = '';
-      input.dispatchEvent(new Event('input', { bubbles: true }));
+      fireInput(input);
     });
   }
 
@@ -652,8 +803,11 @@ class ComposeModal extends Modal {
       ['через 30 минут', 'через 30 минут'],
       ['через 1 час', 'через 1 час'],
       ['через 3 часа', 'через 3 часа'],
-      ['сегодня 18:00', 'сегодня 18:00'],
+      // без слова «сегодня»: если 18:00 уже прошло, это само означает завтра,
+      // а «сегодня 18:00» вечером стало бы ошибкой «время уже прошло»
+      ['в 18:00', '18:00'],
       ['завтра 9:00', 'завтра 9:00'],
+      ['завтра 6:00', 'завтра 6:00'],
     ];
     presets.forEach(([label, value]) => {
       const b = quick.createEl('button', { text: label, cls: 'cs-chip' });
@@ -666,6 +820,7 @@ class ComposeModal extends Modal {
     whenInput.oninput = () => { this.whenRaw = whenInput.value; this.refresh(); };
 
     this.preview = contentEl.createDiv({ cls: 'cs-preview' });
+    this.warn = contentEl.createDiv({ cls: 'cs-warn' });
 
     // Куда
     const targetWrap = contentEl.createDiv({ cls: 'cs-target' });
@@ -677,7 +832,7 @@ class ComposeModal extends Modal {
     sel.onchange = () => { this.target = sel.value; };
     targetWrap.createEl('div', {
       cls: 'cs-hint',
-      text: 'Если в поле ввода будет черновик или агент будет занят — сообщение само уйдёт в новую вкладку, набранное не пропадёт.',
+      text: 'Если в поле ввода будет черновик — сообщение само уйдёт в новую вкладку, набранное не пропадёт. Если Клодиан в этот момент занят, он поставит сообщение в очередь и ответит следом.',
     });
 
     // Кнопки
@@ -708,6 +863,12 @@ class ComposeModal extends Modal {
       this.preview.setText(`Уйдёт ${formatWhen(res.at)} — это ${humanLeft(res.at)}`);
       this.preview.addClass('cs-ok');
     }
+    // Текст со слэша Клодиан примет за свою команду (/clear, /help и прочие)
+    if (String(this.text).trim().startsWith('/')) {
+      this.warn.setText('⚠️ Сообщение начинается со слэша — Клодиан примет его за свою команду, а не за текст. Добавь слово перед слэшем, если это не задумано.');
+    } else {
+      this.warn.setText('');
+    }
     if (this.okBtn) this.okBtn.disabled = !!res.error || !okText;
   }
 
@@ -722,6 +883,7 @@ class ComposeModal extends Modal {
       this.item.fireAt = res.at;
       this.item.target = this.target;
       this.item.status = 'pending';
+      this.item.attempts = 0;
       this.item.note = '';
       await this.plugin.save();
       new Notice(`Перенесено: уйдёт ${formatWhen(res.at)} (${humanLeft(res.at)})`, 6000);
@@ -801,7 +963,6 @@ class ListModal extends Modal {
       const now = row.createEl('button', { text: 'Отправить сейчас' });
       now.onclick = async () => {
         now.disabled = true;
-        item.status = 'pending';
         await this.plugin.fireNow(item);
         this.render();
       };
@@ -840,14 +1001,8 @@ class ScheduleSettingsTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName('Запас на просрочку')
       .setDesc('Обсидиан был закрыт: опоздание меньше этого — всё равно отправляем. Больше — помечаем «просрочено» и показываем в списке.')
-      .addSlider(sl => sl.setLimits(1, 48, 1).setValue(s.graceHours).setDynamicTooltip()
+      .addSlider(sl => sl.setLimits(1, 48, 1).setValue(this.plugin.grace()).setDynamicTooltip()
         .onChange(async v => { s.graceHours = v; await save(); }));
-
-    new Setting(containerEl)
-      .setName('Ждать занятого агента')
-      .setDesc('Сколько минут ждать, если Клодиан в этот момент дописывает ответ. Дольше — сообщение уйдёт в новую вкладку.')
-      .addSlider(sl => sl.setLimits(1, 60, 1).setValue(s.busyWaitMin).setDynamicTooltip()
-        .onChange(async v => { s.busyWaitMin = v; await save(); }));
 
     new Setting(containerEl)
       .setName('Куда класть по умолчанию')
@@ -855,28 +1010,28 @@ class ScheduleSettingsTab extends PluginSettingTab {
       .addDropdown(d => d
         .addOption('current', 'в открытую вкладку')
         .addOption('new', 'в новую вкладку')
-        .setValue(s.defaultTarget)
+        .setValue(s.defaultTarget === 'new' ? 'new' : 'current')
         .onChange(async v => { s.defaultTarget = v; await save(); }));
 
     new Setting(containerEl)
       .setName('Как часто смотреть на часы')
       .setDesc('В секундах. Реже — меньше суеты, точность отправки падает на это же время.')
-      .addSlider(sl => sl.setLimits(10, 120, 5).setValue(s.checkSec).setDynamicTooltip()
-        .onChange(async v => { s.checkSec = v; await save(); }));
+      .addSlider(sl => sl.setLimits(10, 120, 5).setValue(num(s.checkSec, DEFAULTS.checkSec, 10, 120)).setDynamicTooltip()
+        .onChange(async v => { s.checkSec = v; await save(); this.plugin.restartTimer(); }));
 
     new Setting(containerEl)
       .setName('Показывать уведомление при отправке')
-      .addToggle(t => t.setValue(s.notify).onChange(async v => { s.notify = v; await save(); }));
+      .addToggle(t => t.setValue(s.notify !== false).onChange(async v => { s.notify = v; await save(); }));
 
     new Setting(containerEl)
       .setName('Хранить историю, дней')
-      .addSlider(sl => sl.setLimits(1, 90, 1).setValue(s.keepDays).setDynamicTooltip()
+      .addSlider(sl => sl.setLimits(1, 90, 1).setValue(num(s.keepDays, DEFAULTS.keepDays, 1, 90)).setDynamicTooltip()
         .onChange(async v => { s.keepDays = v; await save(); }));
 
     new Setting(containerEl)
       .setName('Вести журнал')
       .setDesc('Файл schedule.log рядом с плагином: что и когда ушло. Нужен, чтобы разбирать «почему не отправилось» по факту.')
-      .addToggle(t => t.setValue(s.writeLog).onChange(async v => { s.writeLog = v; await save(); }));
+      .addToggle(t => t.setValue(s.writeLog !== false).onChange(async v => { s.writeLog = v; await save(); }));
 
     const help = containerEl.createDiv({ cls: 'cs-help' });
     help.createEl('h4', { text: 'Как пользоваться' });
@@ -885,6 +1040,7 @@ class ScheduleSettingsTab extends PluginSettingTab {
     ul.createEl('li', { text: 'Cmd+P → «Отложить сообщение Клодиану» — то же самое из любого места.' });
     ul.createEl('li', { text: 'Счётчик ⏰ внизу окна показывает, сколько сообщений ждёт. Клик — список.' });
     ul.createEl('li', { text: 'Время пишется по-человечески: «через 30 минут», «сегодня 18:00», «завтра 9:00», «24.09 18:30».' });
+    ul.createEl('li', { text: 'Если Клодиан занят, он поставит сообщение в очередь и ответит следом — ждать не нужно.' });
   }
 }
 
@@ -892,6 +1048,7 @@ module.exports = ClaudianSchedulePlugin;
 
 // Внутренности — для тестов (в Обсидиане не используются)
 module.exports._internals = {
-  parseWhen, formatWhen, humanLeft, decideOverdue, shortText,
-  findInput, findEmptyInput, isStreaming, countUserMessages, deliverText, SEL, DEFAULTS,
+  parseWhen, formatWhen, humanLeft, decideOverdue, shortText, buildDate, num,
+  activeInput, freeInput, tabOf, countUserMessages, queueText, sendOutcome,
+  deliverText, isUsable, SEL, DEFAULTS, MAX_ATTEMPTS,
 };
