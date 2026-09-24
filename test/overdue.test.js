@@ -26,22 +26,31 @@ async function t(name, fn) {
 
 /** Плагин с настоящей логикой, но без Обсидиана вокруг. */
 function makePlugin(items, { streaming = false } = {}) {
-  const dom = new JSDOM('<!doctype html><html><body>' +
-    '<div class="workspace-leaf-content" data-type="claudian-view">' +
-    '<div class="claudian-tab-bar">' + (streaming ? '<span class="claudian-tab-badge-streaming"></span>' : '') + '</div>' +
-    '<div class="claudian-messages"></div>' +
-    '<textarea class="claudian-input"></textarea>' +
-    '</div></body></html>');
+  const dom = new JSDOM('<!doctype html><html><body></body></html>');
   const doc = dom.window.document;
-  const ta = doc.querySelector('textarea.claudian-input');
-  ta.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' || !ta.value.trim()) return;
-    const msg = doc.createElement('div');
-    msg.className = 'claudian-message-user';
-    msg.textContent = ta.value;
-    ta.value = '';
-    doc.querySelector('.claudian-messages').appendChild(msg);
-  });
+
+  const addLeaf = (busy = false) => {
+    const leaf = doc.createElement('div');
+    leaf.className = 'workspace-leaf-content';
+    leaf.setAttribute('data-type', 'claudian-view');
+    leaf.innerHTML = '<div class="claudian-tab-bar">' +
+      (busy ? '<span class="claudian-tab-badge-streaming"></span>' : '') +
+      '</div><div class="claudian-messages"></div>';
+    const ta = doc.createElement('textarea');
+    ta.className = 'claudian-input';
+    leaf.appendChild(ta);
+    doc.body.appendChild(leaf);
+    ta.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter' || !ta.value.trim()) return;
+      const msg = doc.createElement('div');
+      msg.className = 'claudian-message-user';
+      msg.textContent = ta.value;
+      ta.value = '';
+      leaf.querySelector('.claudian-messages').appendChild(msg);
+    });
+    return leaf;
+  };
+  addLeaf(streaming);
 
   const p = new Plugin();
   p.settings = Object.assign({}, DEFAULTS);
@@ -57,7 +66,7 @@ function makePlugin(items, { streaming = false } = {}) {
   p.log = (line) => p.logs.push(line);
   p.env = () => ({
     doc,
-    run: async () => {},
+    run: async (id) => { if (id === 'realclaudian:new-tab') addLeaf(false); },
     sleep: async () => {},
     requireMod: false,
     isMac: true,
@@ -124,6 +133,25 @@ const item = (over) => ({
     assert.strictEqual(p.items[0].status, 'pending', 'ждём следующего тика');
     assert.deepStrictEqual(userTexts(p._doc), []);
     assert.ok(p.logs.some(l => /ждём/.test(l)), 'ожидание должно попасть в журнал');
+  });
+
+  await t('ждали дольше положенного — сообщение уходит в новую вкладку, а не висит вечно', async () => {
+    const p = makePlugin([item(1)], { streaming: true });
+    await p.tick();                                   // первый подход: занят, начали ждать
+    assert.strictEqual(p.items[0].status, 'pending');
+    // отматываем начало ожидания на 11 минут назад — предел 10
+    p.busySince.set(p.items[0].id, Date.now() - 11 * 60000);
+    await p.tick();
+    assert.strictEqual(p.items[0].status, 'sent', 'после предела ожидания должно уйти');
+    assert.strictEqual(userTexts(p._doc).length, 1);
+    assert.strictEqual(p.items[0].note, 'ушло в новую вкладку');
+  });
+
+  await t('кнопка «Отправить сейчас» при занятом агенте не ждёт — сразу новая вкладка', async () => {
+    const p = makePlugin([item(1)], { streaming: true });
+    await p.fireNow(p.items[0]);
+    assert.strictEqual(p.items[0].status, 'sent');
+    assert.strictEqual(p.items[0].note, 'ушло в новую вкладку');
   });
 
   await t('сбой доставки не оставляет сообщение в «отправляется» навсегда', async () => {

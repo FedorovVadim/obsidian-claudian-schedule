@@ -207,13 +207,20 @@ function findInput(doc) {
 }
 
 /**
- * Пустое видимое поле ввода — им пользуемся после открытия новой вкладки.
- * Клодиан может и переключить вкладку внутри того же окна (элемент тот же, но пустой),
- * и открыть новую панель (элемент другой). Оба случая закрываются поиском пустого поля.
+ * Свободное поле ввода — им пользуемся после открытия новой вкладки.
+ *
+ * Свободное значит: видимое, пустое (чужой черновик не трогаем) и в невнятой вкладке
+ * (агент там не печатает). Идём с конца: новая вкладка добавляется последней, а если
+ * открыты две панели рядом, первой в списке может оказаться как раз занятая.
  */
 function findEmptyInput(doc) {
-  const list = doc.querySelectorAll(`${SEL.leaf} ${SEL.input}`);
-  for (const el of list) if (isVisible(el) && !(el.value || '').trim()) return el;
+  const list = Array.from(doc.querySelectorAll(`${SEL.leaf} ${SEL.input}`)).reverse();
+  for (const el of list) {
+    if (!isVisible(el)) continue;
+    if ((el.value || '').trim()) continue;
+    if (isStreaming(doc, el)) continue;
+    return el;
+  }
   return null;
 }
 
@@ -267,13 +274,15 @@ async function deliverText(env, text, target) {
     if (!input) return { ok: false, reason: 'окно Клодиана не открылось' };
   }
 
-  // 2. Агент печатает — не встреваем, вернёмся позже
-  if (isStreaming(doc, input)) return { ok: false, retry: true, reason: 'агент печатает ответ' };
-
-  // 3. Куда класть. В поле есть черновик — не трогаем его, уходим в новую вкладку.
+  // 2. Куда класть.
   let via = target === 'new' ? 'new' : 'current';
-  const draft = (input.value || '').trim();
-  if (draft) via = 'new';
+
+  if (via === 'current') {
+    // Агент печатает в этой вкладке — не встреваем, вернёмся позже
+    if (isStreaming(doc, input)) return { ok: false, retry: true, reason: 'агент печатает ответ' };
+    // В поле набран черновик — не трогаем его, уходим в новую вкладку
+    if ((input.value || '').trim()) via = 'new';
+  }
 
   if (via === 'new') {
     await run('realclaudian:new-tab');
@@ -283,6 +292,8 @@ async function deliverText(env, text, target) {
     // Это временная помеха, а не отказ: вернёмся на следующем тике.
     if (!fresh) return { ok: false, retry: true, reason: 'новая вкладка не открылась' };
     input = fresh;
+    // В новой вкладке агент свободен; если вдруг нет — ждём дальше
+    if (isStreaming(doc, input)) return { ok: false, retry: true, reason: 'агент печатает ответ' };
   }
 
   // 4. Вставляем и отправляем
@@ -462,21 +473,28 @@ class ClaudianSchedulePlugin extends Plugin {
     }
   }
 
-  /** Отправка одного сообщения. */
-  async fire(item, now = Date.now()) {
+  /**
+   * Отправка одного сообщения.
+   * force = «не ждать освободившегося агента» (кнопка «Отправить сейчас»).
+   */
+  async fire(item, now = Date.now(), force = false) {
     item.status = 'sending';
     item.attempts = (item.attempts || 0) + 1;
     await this.save();
 
-    // Ждать ли, если агент занят: копим время ожидания по каждому сообщению
-    const waitedFrom = this.busySince.get(item.id) || now;
-    const waitedMin = (now - waitedFrom) / 60000;
-    const forceNewTab = waitedMin >= this.settings.busyWaitMin;
+    // Сколько уже ждём освобождения агента по этому сообщению
+    const waitedFrom = this.busySince.has(item.id) ? this.busySince.get(item.id) : now;
+    const waitedTooLong = (now - waitedFrom) / 60000 >= this.settings.busyWaitMin;
 
     // Любая неожиданная поломка не должна оставить сообщение навсегда в «отправляется»
     let res;
     try {
-      res = await deliverText(this.env(), item.text, forceNewTab ? 'new' : item.target);
+      const env = this.env();
+      res = await deliverText(env, item.text, item.target);
+      // Агент занят, а ждать больше нельзя — уходим в новую вкладку, там он свободен
+      if (!res.ok && res.retry && (force || waitedTooLong)) {
+        res = await deliverText(env, item.text, 'new');
+      }
     } catch (e) {
       res = { ok: false, reason: `сбой при отправке: ${e && e.message ? e.message : e}` };
       console.error('[claudian-schedule] сбой доставки:', e);
@@ -510,10 +528,9 @@ class ClaudianSchedulePlugin extends Plugin {
     new Notice(`Отложенное сообщение не ушло: ${item.note}`, 12000);
   }
 
-  /** Отправить прямо сейчас (кнопка в списке). */
+  /** Отправить прямо сейчас (кнопка в списке) — занятого агента не ждём. */
   async fireNow(item) {
-    this.busySince.set(item.id, 0); // не ждать занятости — сразу в новую вкладку, если занят
-    await this.fire(item);
+    await this.fire(item, Date.now(), true);
   }
 
   env() {
@@ -544,6 +561,9 @@ class ClaudianSchedulePlugin extends Plugin {
 
   /** Кнопка ⏰ в панели ввода Клодиана — отложить то, что уже набрано. */
   mountButtons() {
+    // Клодиан пересобирает панель при переключении вкладок — выбрасываем из учёта
+    // кнопки, которых уже нет на странице, иначе список растёт всю сессию
+    this.buttons.forEach(b => { if (!b.isConnected) this.buttons.delete(b); });
     const toolbars = document.querySelectorAll(SEL.toolbar);
     toolbars.forEach(tb => {
       if (tb.querySelector('.cs-clock-btn')) return;
