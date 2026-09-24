@@ -444,7 +444,7 @@ class ClaudianSchedulePlugin extends Plugin {
         `Открой список, чтобы отправить или удалить.`, 10000);
     }
     await this.prune();
-    this.tick();
+    await this.tick();   // ждём именно отправку: иначе «проверил просрочку» ≠ «сообщение ушло»
   }
 
   async tick() {
@@ -473,7 +473,14 @@ class ClaudianSchedulePlugin extends Plugin {
     const waitedMin = (now - waitedFrom) / 60000;
     const forceNewTab = waitedMin >= this.settings.busyWaitMin;
 
-    const res = await deliverText(this.env(), item.text, forceNewTab ? 'new' : item.target);
+    // Любая неожиданная поломка не должна оставить сообщение навсегда в «отправляется»
+    let res;
+    try {
+      res = await deliverText(this.env(), item.text, forceNewTab ? 'new' : item.target);
+    } catch (e) {
+      res = { ok: false, reason: `сбой при отправке: ${e && e.message ? e.message : e}` };
+      console.error('[claudian-schedule] сбой доставки:', e);
+    }
 
     if (res.ok) {
       this.busySince.delete(item.id);
@@ -543,7 +550,10 @@ class ClaudianSchedulePlugin extends Plugin {
       const btn = tb.createEl('button', { cls: 'cs-clock-btn clickable-icon' });
       btn.setAttribute('aria-label', 'Отложить сообщение на время');
       btn.title = 'Отложить сообщение на время';
-      try { setIcon(btn, 'alarm-clock'); } catch (e) { btn.setText('⏰'); }
+      // setIcon при неизвестном имени значка молча ничего не рисует — проверяем результат,
+      // а не сам вызов, иначе кнопка окажется пустой (§🚥 v3.59).
+      try { setIcon(btn, 'alarm-clock'); } catch (e) { /* ниже поставим запасной значок */ }
+      if (!btn.childElementCount) btn.setText('⏰');
       btn.onclick = (e) => { e.preventDefault(); this.composeFromInput(); };
       this.buttons.add(btn);
     });
@@ -560,7 +570,7 @@ class ClaudianSchedulePlugin extends Plugin {
   }
 
   openComposer(text, onScheduled) {
-    new ComposeModal(this.app, this, text || '', onScheduled).open();
+    new ComposeModal(this.app, this, { text: text || '', onScheduled }).open();
   }
 
   // ── Журнал ───────────────────────────────────────────────────────────────
@@ -586,19 +596,25 @@ class ClaudianSchedulePlugin extends Plugin {
 // ────────────────────────────────────────────────────────────────────────────
 
 class ComposeModal extends Modal {
-  constructor(app, plugin, text, onScheduled) {
+  /**
+   * opts: { text, item, onScheduled, onDone }
+   * item задан — окно работает как «перенести»: меняем время у существующего сообщения.
+   */
+  constructor(app, plugin, opts = {}) {
     super(app);
     this.plugin = plugin;
-    this.text = text || '';
+    this.item = opts.item || null;
+    this.text = this.item ? this.item.text : (opts.text || '');
     this.whenRaw = 'через 1 час';
-    this.target = plugin.settings.defaultTarget;
-    this.onScheduled = onScheduled;
+    this.target = this.item ? this.item.target : plugin.settings.defaultTarget;
+    this.onScheduled = opts.onScheduled;
+    this.onDone = opts.onDone;
   }
 
   onOpen() {
     const { contentEl } = this;
     contentEl.addClass('cs-modal');
-    contentEl.createEl('h3', { text: 'Отложить сообщение Клодиану' });
+    contentEl.createEl('h3', { text: this.item ? 'Перенести сообщение' : 'Отложить сообщение Клодиану' });
 
     // Текст
     contentEl.createEl('label', { text: 'Сообщение', cls: 'cs-label' });
@@ -646,7 +662,7 @@ class ComposeModal extends Modal {
 
     // Кнопки
     const row = contentEl.createDiv({ cls: 'cs-row' });
-    this.okBtn = row.createEl('button', { text: 'Запланировать', cls: 'mod-cta' });
+    this.okBtn = row.createEl('button', { text: this.item ? 'Перенести' : 'Запланировать', cls: 'mod-cta' });
     this.okBtn.onclick = () => this.submit();
     const cancel = row.createEl('button', { text: 'Отмена' });
     cancel.onclick = () => this.close();
@@ -680,10 +696,22 @@ class ComposeModal extends Modal {
     if (!text) { new Notice('Сначала напиши сообщение'); return; }
     const res = parseWhen(this.whenRaw);
     if (res.error) { new Notice(`Время: ${res.error}`); return; }
-    await this.plugin.addItem(text, res.at, this.target);
-    new Notice(`Отложено: уйдёт ${formatWhen(res.at)} (${humanLeft(res.at)})`, 6000);
+
+    if (this.item) {
+      this.item.text = text;
+      this.item.fireAt = res.at;
+      this.item.target = this.target;
+      this.item.status = 'pending';
+      this.item.note = '';
+      await this.plugin.save();
+      new Notice(`Перенесено: уйдёт ${formatWhen(res.at)} (${humanLeft(res.at)})`, 6000);
+    } else {
+      await this.plugin.addItem(text, res.at, this.target);
+      new Notice(`Отложено: уйдёт ${formatWhen(res.at)} (${humanLeft(res.at)})`, 6000);
+    }
     if (this.onScheduled) { try { this.onScheduled(); } catch (e) {} }
     this.close();
+    if (this.onDone) { try { this.onDone(); } catch (e) {} }
   }
 
   onClose() { this.contentEl.empty(); }
@@ -759,14 +787,8 @@ class ListModal extends Modal {
       };
       const move = row.createEl('button', { text: 'Перенести' });
       move.onclick = () => {
-        const raw = window.prompt('На когда перенести? Например: через 30 минут, завтра 9:00', 'через 1 час');
-        if (raw == null) return;
-        const res = parseWhen(raw);
-        if (res.error) { new Notice(`Время: ${res.error}`); return; }
-        item.fireAt = res.at;
-        item.status = 'pending';
-        item.note = '';
-        this.plugin.save().then(() => this.render());
+        // window.prompt в Обсидиане (Electron) не работает — только своё окно
+        new ComposeModal(this.app, this.plugin, { item, onDone: () => this.render() }).open();
       };
     }
     const del = row.createEl('button', { text: 'Удалить', cls: 'mod-warning' });

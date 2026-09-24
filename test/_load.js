@@ -14,12 +14,16 @@ const path = require('path');
 class Fake {
   constructor() {}
 }
+
+// Всплывающие окна складываем сюда — так тест видит, сказали владельцу или промолчали.
+const notices = [];
+
 const fakeObsidian = {
   Plugin: class extends Fake {},
   PluginSettingTab: class extends Fake {},
   Setting: class extends Fake {},
   Modal: class extends Fake {},
-  Notice: class extends Fake {},
+  Notice: class { constructor(text) { notices.push(String(text)); } },
   setIcon: () => {},
   requestUrl: async () => ({ status: 200 }),
   Platform: { isMacOS: true },
@@ -33,4 +37,4 @@ Module._load = function (request, parent, isMain) {
 
 const plugin = require(path.join(__dirname, '..', 'main.js'));
 
-module.exports = { internals: plugin._internals, fakeObsidian };
+module.exports = { internals: plugin._internals, fakeObsidian, notices };
