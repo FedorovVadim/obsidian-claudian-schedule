@@ -1,0 +1,9 @@
+{
+  "id": "claudian-schedule",
+  "name": "Claudian Schedule",
+  "version": "1.0.0",
+  "minAppVersion": "1.7.2",
+  "description": "Отложенные сообщения Клодиану: пишешь сейчас, а плагин сам отправляет их в чат в назначенное время.",
+  "author": "Vadim Fedorov + Claudian",
+  "isDesktopOnly": true
+}

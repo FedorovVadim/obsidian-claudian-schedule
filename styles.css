@@ -1,0 +1,93 @@
+/* Claudian Schedule — отложенные сообщения */
+
+.cs-modal { max-width: 640px; }
+
+.cs-modal .cs-label {
+  display: block;
+  margin: 12px 0 4px;
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+
+.cs-modal .cs-text {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  font-family: var(--font-text);
+}
+
+.cs-modal .cs-when { width: 100%; margin-top: 6px; }
+
+.cs-quick { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.cs-chip {
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: var(--font-ui-smaller);
+  background: var(--background-modifier-hover);
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+}
+.cs-chip:hover { background: var(--interactive-hover); }
+
+.cs-preview {
+  margin: 8px 0 4px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--background-secondary);
+  font-size: var(--font-ui-small);
+  color: var(--text-warning);
+}
+.cs-preview.cs-ok { color: var(--text-accent); }
+
+.cs-target { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.cs-target select { max-width: 240px; }
+
+.cs-hint {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.cs-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+
+.cs-add { margin-bottom: 8px; }
+
+.cs-item {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: var(--background-primary-alt);
+}
+
+.cs-item-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.cs-item-text {
+  margin-top: 6px;
+  font-size: var(--font-ui-small);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cs-time { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+
+.cs-badge {
+  font-size: var(--font-ui-smaller);
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--background-modifier-border);
+  color: var(--text-normal);
+}
+.cs-badge.cs-pending { background: var(--color-accent); color: var(--text-on-accent); }
+.cs-badge.cs-sending { background: var(--color-blue); color: var(--text-on-accent); }
+.cs-badge.cs-sent    { background: var(--color-green); color: var(--text-on-accent); }
+.cs-badge.cs-missed  { background: var(--color-orange); color: var(--text-on-accent); }
+.cs-badge.cs-failed  { background: var(--color-red); color: var(--text-on-accent); }
+
+.cs-status { cursor: pointer; }
+
+.cs-clock-btn { display: inline-flex; align-items: center; justify-content: center; }
+
+.cs-help { margin-top: 18px; }
+.cs-help ul { padding-left: 18px; font-size: var(--font-ui-small); color: var(--text-muted); }

@@ -1,0 +1,12 @@
+{
+  "name": "obsidian-claudian-schedule",
+  "version": "1.0.0",
+  "description": "Отложенные сообщения Клодиану в Obsidian",
+  "private": true,
+  "scripts": {
+    "test": "node test/when.test.js && node test/deliver.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  }
+}
