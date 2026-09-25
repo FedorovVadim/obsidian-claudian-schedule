@@ -16,7 +16,7 @@
 const assert = require('assert');
 const { internals } = require('./_load');
 const { makeClaudian } = require('./_claudian');
-const { deliverText, activeInput, countUserMessages, sendOutcome, tabOf } = internals;
+const { deliverText, activeInput, countUserMessages, sendOutcome, tabOf, listTabs, matchTab } = internals;
 
 let passed = 0;
 async function t(name, fn) {
@@ -160,6 +160,57 @@ async function t(name, fn) {
     assert.strictEqual(c.tabs[0].ta.value, 'черновик Вадима', 'черновик трогать нельзя даже так');
   });
 
+  console.log('Окно в фоне (случай 25.09.2026 — ложное «не ушло»):');
+
+  await t('окно в фоне: на экране сообщения ещё нет, но Клодиан его принял — это УСПЕХ', async () => {
+    const c = makeClaudian({ background: true });
+    const res = await deliverText(c.env, 'продолжи работу', 'current');
+    assert.strictEqual(res.ok, true, `так выглядела ошибка 25.09: получено «${res.reason}»`);
+    assert.deepStrictEqual(c.userTexts(), [], 'на экране его и правда нет');
+    assert.strictEqual(c.accepted.length, 1, 'но Клодиан его принял');
+  });
+
+  await t('окно в фоне и записи о приёме нет — честный отказ, выдумывать успех нельзя', async () => {
+    const c = makeClaudian({ background: true, deaf: true });
+    const res = await deliverText(c.env, 'в пустоту', 'current');
+    assert.strictEqual(res.ok, false);
+    assert.strictEqual(c.accepted.length, 0);
+  });
+
+  console.log('Выбор чата, куда положить:');
+
+  await t('сообщение уходит в ВЫБРАННЫЙ чат, даже если открыт другой', async () => {
+    const c = makeClaudian({ titles: ['Альба Авис', 'BIORISE'] });
+    const second = c.addTab(0);                    // вторая вкладка, теперь активна она
+    const tabs = listTabs(c.env.roots());
+    assert.strictEqual(tabs.length, 2);
+    assert.strictEqual(tabs[1].active, true, 'активна вторая');
+
+    const res = await deliverText(c.env, 'в первый чат', { title: 'Альба Авис', win: 0, index: 0 });
+    assert.strictEqual(res.ok, true, `получено: ${res.reason}`);
+    const inFirst = c.tabs[0].messages.querySelectorAll('[data-role="user"]').length;
+    const inSecond = second.messages.querySelectorAll('[data-role="user"]').length;
+    assert.strictEqual(inFirst, 1, 'должно лечь в выбранный чат');
+    assert.strictEqual(inSecond, 0, 'в чужой чат класть нельзя');
+  });
+
+  await t('выбранный чат закрыли — кладём в открытый и честно помечаем', async () => {
+    const c = makeClaudian({ titles: ['Альба Авис'] });
+    const res = await deliverText(c.env, 'чат исчез', { title: 'Закрытый чат', win: 0, index: 5 });
+    assert.strictEqual(res.ok, true);
+    assert.ok(/не найдена/.test(res.note), `нужна пометка, получено: ${res.note}`);
+  });
+
+  await t('matchTab находит вкладку по названию даже если она переехала', async () => {
+    const tabs = [
+      { title: 'BIORISE', win: 0, index: 0 },
+      { title: 'Альба Авис', win: 0, index: 1 },
+    ];
+    assert.strictEqual(matchTab(tabs, { title: 'Альба Авис', win: 0, index: 0 }).index, 1);
+    assert.strictEqual(matchTab(tabs, { title: 'Нет такой', win: 0, index: 1 }).title, 'Альба Авис');
+    assert.strictEqual(matchTab(tabs, { title: 'Нет такой', win: 3, index: 9 }), null);
+  });
+
   console.log('Учения — проверка самой проверки:');
 
   await t('переименовали класс поля ввода — доставка падает, а не делает вид', async () => {
@@ -170,11 +221,15 @@ async function t(name, fn) {
     assert.strictEqual(res.ok, false, 'смена вёрстки Клодиана обязана ломать доставку явно');
   });
 
-  await t('убрали строку очереди — занятый агент перестаёт давать ложный успех', async () => {
+  await t('убрали строку очереди — успех остаётся, но плагин перестаёт врать про очередь', async () => {
     const c = makeClaudian({ busy: true });
     c.tabs[0].queue.className = 'claudian-input-queue-row-v3';
     const res = await deliverText(c.env, 'проверка учения', 'current');
-    assert.strictEqual(res.ok, false, 'без видимой очереди подтверждения нет');
+    // сообщение Клодиан всё равно забрал (поле опустело) — отказом это быть не может,
+    // но и утверждать «в очереди» мы больше не вправе
+    assert.strictEqual(res.ok, true);
+    assert.ok(!/очеред/.test(res.note), `про очередь знать неоткуда, получено: ${res.note}`);
+    assert.ok(/принято|поле опустело/.test(res.note), `нужна честная формулировка, получено: ${res.note}`);
   });
 
   console.log('Вспомогательное:');

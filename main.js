@@ -33,7 +33,9 @@ const { Plugin, PluginSettingTab, Setting, Notice, Modal, setIcon, Platform } = 
 const DEFAULTS = {
   graceHours: 12,           // опоздание меньше этого — всё равно отправляем при запуске
   checkSec: 20,             // как часто смотреть на часы
-  defaultTarget: 'current', // 'current' — в открытую вкладку, 'new' — в новую
+  // 'active' — тот чат, что открыт в момент создания (и он же будет активирован перед
+  // отправкой), 'current' — какой будет открыт в момент отправки, 'new' — новая вкладка
+  defaultTarget: 'active',
   notify: true,             // показывать всплывающие уведомления об отправке
   keepDays: 14,             // сколько дней держать историю отправленных
   writeLog: true,           // вести schedule.log рядом с плагином
@@ -212,6 +214,37 @@ function decideOverdue(item, now, graceHours) {
   return 'miss';
 }
 
+/** Время из колеса в режиме «в какое время»: прошедшее сегодня переносится на завтра. */
+function wheelClockAt(hh, mm, now = Date.now()) {
+  return parseWhen(`${pad(hh)}:${pad(mm)}`, now);
+}
+
+/** Время из колеса в режиме «через сколько». */
+function wheelAfterAt(h, m, now = Date.now()) {
+  const total = Number(h) * 60 + Number(m);
+  if (!(total > 0)) return { error: 'выбери хотя бы одну минуту' };
+  return finishDate(now + total * 60000, now);
+}
+
+/**
+ * Куда класть сообщение: 'current' (та вкладка, что будет открыта), 'new' (новая)
+ * или конкретный чат {title, win, index}.
+ */
+function normalizeTarget(target) {
+  if (target === 'new') return 'new';
+  if (target && typeof target === 'object' && target.title) {
+    return { title: String(target.title), win: Number(target.win) || 0, index: Number(target.index) || 0 };
+  }
+  return 'current';
+}
+
+/** Как показать выбор человеку. */
+function targetLabel(target) {
+  if (target === 'new') return 'в новую вкладку';
+  if (target && typeof target === 'object' && target.title) return `в чат «${target.title}»`;
+  return 'в открытую вкладку';
+}
+
 /** Короткая выжимка текста для списков и уведомлений. */
 function shortText(text, limit = 70) {
   const one = String(text || '').replace(/\s+/g, ' ').trim();
@@ -233,8 +266,42 @@ const SEL = {
   userMsg: '[data-role="user"], .claudian-message-user',
   queue: '.claudian-input-queue-row',
   toolbar: '.claudian-input-toolbar',
+  badge: '.claudian-tab-badge',
+  badgeActive: 'claudian-tab-badge-active',
   hiddenCls: 'claudian-hidden',
 };
+
+/**
+ * Список открытых вкладок Клодиана — по значкам в полоске вкладок.
+ * Название лежит в aria-label значка («Название, состояние»), щелчок по значку
+ * переключает на эту вкладку (проверено по коду Клодиана 2.2.6, renderBadge).
+ */
+function listTabs(roots) {
+  const out = [];
+  (roots || []).forEach((root, win) => {
+    if (!root || !root.querySelectorAll) return;
+    Array.from(root.querySelectorAll(SEL.badge)).forEach((el, index) => {
+      const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+      const title = norm(aria.replace(/,[^,]*$/, '')) || `вкладка ${index + 1}`;
+      out.push({
+        title, index, win, el,
+        active: !!(el.classList && el.classList.contains(SEL.badgeActive)),
+      });
+    });
+  });
+  return out;
+}
+
+/** Найти вкладку по сохранённой примете: сперва по названию и окну, потом по месту. */
+function matchTab(tabs, want) {
+  if (!want) return null;
+  const byTitle = tabs.filter(t => t.title === want.title);
+  if (byTitle.length === 1) return byTitle[0];
+  const exact = byTitle.find(t => t.win === want.win);
+  if (exact) return exact;
+  if (byTitle.length) return byTitle[0];
+  return tabs.find(t => t.win === want.win && t.index === want.index) || null;
+}
 
 /** Есть ли в документе раскладка (в тестовой среде её нет — размеры всегда нулевые). */
 function hasLayout(doc) {
@@ -355,7 +422,22 @@ function fireInput(el) {
  */
 async function deliverText(env, text, target) {
   const sleep = env.sleep;
-  const verifyTimeoutMs = env.verifyTimeoutMs == null ? 8000 : env.verifyTimeoutMs;
+  const verifyTimeoutMs = env.verifyTimeoutMs == null ? 25000 : env.verifyTimeoutMs;
+  const startedAt = (env.now ? env.now() : Date.now()) - 2000;
+  let viaNote = '';
+
+  // 0. Нужна определённая вкладка — переключаемся на неё щелчком по значку.
+  //    Это же решает случай «Обсидиан в другом окне»: активная вкладка станет нашей.
+  const wantTab = (target && typeof target === 'object' && target.title) ? target : null;
+  if (wantTab) {
+    const found = matchTab(listTabs(env.roots()), wantTab);
+    if (!found) {
+      viaNote = `вкладка «${wantTab.title}» не найдена, положил в открытую`;
+    } else if (!found.active && found.el && found.el.click) {
+      found.el.click();
+      await sleep(500);
+    }
+  }
 
   let input = activeInput(env.roots());
 
@@ -374,7 +456,6 @@ async function deliverText(env, text, target) {
   let via = target === 'new' ? 'new' : 'current';
   if (via === 'current' && (input.value || '').trim()) via = 'new';
 
-  let viaNote = '';
   if (via === 'new') {
     const opened = await env.run('new-tab');
     await sleep(800);
@@ -404,12 +485,23 @@ async function deliverText(env, text, target) {
   //    Повторное нажатие — только если настройку прочитать не удалось И поле не тронуто:
   //    у Клодиана при выключенном «Cmd+Enter» проходят ОБА нажатия, и вслепую
   //    подстрахованное второе отправляет сообщение дважды.
+  const done = (note) => ({ ok: true, via, note: viaNote ? `${viaNote}, ${note}` : note });
   const step = 200;
   let waited = 0;
   let repressed = env.modKnown === true;
   while (waited < verifyTimeoutMs) {
     const outcome = sendOutcome(input, text, before);
-    if (outcome) return { ok: true, via, note: viaNote ? `${viaNote}, ${outcome}` : outcome };
+    if (outcome) return done(outcome);
+
+    // Окно Обсидиана может быть в фоне — тогда Клодиан принимает сообщение сразу,
+    // а рисует его на экране позже. Поэтому кроме экрана смотрим запись на диске:
+    // Клодиан складывает принятые сообщения в .claudian/sessions/*.inputs.json.
+    // Именно этот случай 25.09.2026 дал ложное «не ушло».
+    if (env.durable && waited > 0 && waited % 2000 === 0) {
+      const rec = await env.durable(text, startedAt);
+      if (rec) return done(rec.where ? `принято Клодианом (беседа ${rec.where})` : 'принято Клодианом');
+    }
+
     if (!repressed && waited >= 1500 && (input.value || '') === text) {
       pressEnter(input, !env.requireMod, env.isMac);
       repressed = true;
@@ -418,12 +510,55 @@ async function deliverText(env, text, target) {
     waited += step;
   }
 
-  // 5. Не ушло — убираем свой текст, чтобы не оставлять мусор в поле
+  // 5. Последняя проверка на диске — вдруг успело между заходами
+  if (env.durable) {
+    const rec = await env.durable(text, startedAt);
+    if (rec) return done(rec.where ? `принято Клодианом (беседа ${rec.where})` : 'принято Клодианом');
+  }
+
+  // 6. Поле опустело, а текст наш никуда не делся из виду — значит Клодиан его забрал.
+  //    Слабое доказательство, поэтому говорим об этом прямо.
+  if (!(input.value || '').trim()) {
+    return done('поле опустело — похоже, Клодиан принял, но подтверждения в переписке нет');
+  }
+
+  // 7. Не ушло — убираем свой текст, чтобы не оставлять мусор в поле
   if ((input.value || '') === text) {
     input.value = '';
     fireInput(input);
   }
   return { ok: false, reason: 'Клодиан не принял сообщение (в переписке оно не появилось)' };
+}
+
+/**
+ * Поиск записи о принятом сообщении в хранилище Клодиана.
+ * Разбирается с настоящими файлами, поэтому проверяется тестом на временной папке.
+ *
+ * fsMod / pathMod передаются снаружи, чтобы функция не зависела от среды.
+ */
+function findDurableRecord(fsMod, pathMod, sessionsDir, text, sinceMs) {
+  const want = norm(text);
+  if (!want) return null;
+  let files;
+  try { files = fsMod.readdirSync(sessionsDir); } catch (e) { return null; }
+  for (const name of files) {
+    if (!name.endsWith('.inputs.json')) continue;
+    const full = pathMod.join(sessionsDir, name);
+    try {
+      // файл мог не меняться с момента отправки — тогда и смотреть нечего
+      if (fsMod.statSync(full).mtimeMs < sinceMs) continue;
+      const data = JSON.parse(fsMod.readFileSync(full, 'utf8'));
+      const recs = Array.isArray(data.records) ? data.records : [];
+      for (let i = recs.length - 1; i >= 0 && i >= recs.length - 10; i--) {
+        const r = recs[i];
+        if (!r || typeof r.timestamp !== 'number' || r.timestamp < sinceMs) continue;
+        if (norm(r.rawDisplayText || r.canonicalText || '') === want) {
+          return { where: name.replace(/\.inputs\.json$/, ''), timestamp: r.timestamp, state: r.state };
+        }
+      }
+    } catch (e) { /* испорченный или занятый файл — просто пропускаем */ }
+  }
+  return null;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -515,7 +650,7 @@ class ClaudianSchedulePlugin extends Plugin {
       id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
       text: String(text),
       fireAt,
-      target: target === 'new' ? 'new' : 'current',
+      target: normalizeTarget(target),
       createdAt: Date.now(),
       status: 'pending',
       attempts: 0,
@@ -694,10 +829,30 @@ class ClaudianSchedulePlugin extends Plugin {
       roots: () => this.claudianRoots(),
       run: (suffix) => this.runClaudianCommand(suffix),
       sleep: (ms) => new Promise(r => window.setTimeout(r, ms)),
+      durable: async (text, since) => this.durableCheck(text, since),
       requireMod,
       modKnown,
       isMac: typeof Platform !== 'undefined' ? !!Platform.isMacOS : true,
     };
+  }
+
+  /** Принял ли Клодиан сообщение на самом деле — по его же записи на диске. */
+  durableCheck(text, since) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const dir = path.join(this.app.vault.adapter.getBasePath(), '.claudian', 'sessions');
+      return findDurableRecord(fs, path, dir, text, since);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /** Открытые вкладки Клодиана — для выбора в окне создания. */
+  tabs() {
+    return listTabs(this.claudianRoots()).map(t => ({
+      title: t.title, index: t.index, win: t.win, active: t.active,
+    }));
   }
 
   // ── Лицо ─────────────────────────────────────────────────────────────────
@@ -763,6 +918,73 @@ class ClaudianSchedulePlugin extends Plugin {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Колесо выбора времени — как в часах на айфоне
+// ────────────────────────────────────────────────────────────────────────────
+
+const WHEEL_ITEM_H = 34;   // высота строки колеса в точках, та же цифра в styles.css
+
+function range(n) { return Array.from({ length: n }, (_, i) => i); }
+
+/** Какое деление колеса сейчас в середине. Чистая функция — проверяется тестом. */
+function wheelIndexFromScroll(scrollTop, itemH, count) {
+  const h = itemH > 0 ? itemH : 1;
+  const i = Math.round((Number(scrollTop) || 0) / h);
+  return Math.min(Math.max(count - 1, 0), Math.max(0, i));
+}
+
+/**
+ * Прокручиваемое колесо значений. Пролистывается пальцем, колесом мыши и щелчком
+ * по нужной цифре; выбранное деление подсвечивается, как в айфоне.
+ */
+function makeWheel(parent, values, initial, label, onChange) {
+  const box = parent.createDiv({ cls: 'cs-wheel' });
+  const scroller = box.createDiv({ cls: 'cs-wheel-scroll' });
+  scroller.createDiv({ cls: 'cs-wheel-pad' });
+  values.forEach((v, i) => {
+    const it = scroller.createDiv({ cls: 'cs-wheel-item', text: pad(v) });
+    it.onclick = () => api.set(i, true);
+  });
+  scroller.createDiv({ cls: 'cs-wheel-pad' });
+  box.createDiv({ cls: 'cs-wheel-label', text: label });
+
+  let idx = Math.max(0, values.indexOf(initial));
+  let timer = null;
+
+  const paint = () => {
+    Array.from(scroller.querySelectorAll('.cs-wheel-item')).forEach((el, i) => {
+      if (i === idx) el.addClass('cs-wheel-on'); else el.removeClass('cs-wheel-on');
+    });
+  };
+
+  const api = {
+    set(i, smooth) {
+      idx = Math.min(values.length - 1, Math.max(0, i));
+      const top = idx * WHEEL_ITEM_H;
+      if (scroller.scrollTo) scroller.scrollTo({ top, behavior: smooth ? 'smooth' : 'auto' });
+      else scroller.scrollTop = top;
+      paint();
+      onChange(values[idx]);
+    },
+    value: () => values[idx],
+  };
+
+  scroller.addEventListener('scroll', () => {
+    if (timer) window.clearTimeout(timer);
+    timer = window.setTimeout(() => {
+      const i = wheelIndexFromScroll(scroller.scrollTop, WHEEL_ITEM_H, values.length);
+      const changed = i !== idx;
+      idx = i;
+      paint();
+      if (changed) onChange(values[idx]);
+    }, 120);
+  });
+
+  // начальное положение — когда колесо уже в документе и у него есть высота
+  window.setTimeout(() => { scroller.scrollTop = idx * WHEEL_ITEM_H; paint(); }, 0);
+  return api;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Окно «отложить сообщение»
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -776,7 +998,11 @@ class ComposeModal extends Modal {
     this.plugin = plugin;
     this.item = opts.item || null;
     this.text = this.item ? this.item.text : (opts.text || '');
-    this.whenRaw = 'через 1 час';
+    this.mode = 'clock';              // 'clock' — в какое время, 'after' — через сколько
+    this.hh = 9; this.mm = 0;         // колесо «в какое время»
+    this.ah = 0; this.am = 30;        // колесо «через сколько»
+    this.whenRaw = '';                // если написано словами — оно главнее колеса
+    this.tabs = [];
     this.target = this.item ? this.item.target : plugin.settings.defaultTarget;
     this.onScheduled = opts.onScheduled;
     this.onDone = opts.onDone;
@@ -787,55 +1013,87 @@ class ComposeModal extends Modal {
     contentEl.addClass('cs-modal');
     contentEl.createEl('h3', { text: this.item ? 'Перенести сообщение' : 'Отложить сообщение Клодиану' });
 
-    // Текст
+    // ── Сообщение ──
     contentEl.createEl('label', { text: 'Сообщение', cls: 'cs-label' });
     const ta = contentEl.createEl('textarea', { cls: 'cs-text' });
     ta.value = this.text;
     ta.placeholder = 'Что Клодиан должен получить в назначенное время…';
-    ta.rows = 6;
+    ta.rows = 5;
     ta.oninput = () => { this.text = ta.value; this.refresh(); };
 
-    // Быстрые кнопки
+    // ── Когда: переключатель режима ──
     contentEl.createEl('label', { text: 'Когда', cls: 'cs-label' });
-    const quick = contentEl.createDiv({ cls: 'cs-quick' });
-    const presets = [
-      ['через 15 минут', 'через 15 минут'],
-      ['через 30 минут', 'через 30 минут'],
-      ['через 1 час', 'через 1 час'],
-      ['через 3 часа', 'через 3 часа'],
-      // без слова «сегодня»: если 18:00 уже прошло, это само означает завтра,
-      // а «сегодня 18:00» вечером стало бы ошибкой «время уже прошло»
-      ['в 18:00', '18:00'],
-      ['завтра 9:00', 'завтра 9:00'],
-      ['завтра 6:00', 'завтра 6:00'],
-    ];
-    presets.forEach(([label, value]) => {
-      const b = quick.createEl('button', { text: label, cls: 'cs-chip' });
-      b.onclick = () => { this.whenRaw = value; whenInput.value = value; this.refresh(); };
-    });
+    const modes = contentEl.createDiv({ cls: 'cs-modes' });
+    const mkMode = (key, label) => {
+      const b = modes.createEl('button', { text: label, cls: 'cs-mode' });
+      b.onclick = () => {
+        this.mode = key;
+        this.whenRaw = '';
+        wordsInput.value = '';
+        modes.querySelectorAll('.cs-mode').forEach(x => x.removeClass('cs-mode-on'));
+        b.addClass('cs-mode-on');
+        clockWrap.toggleClass('cs-hide', key !== 'clock');
+        afterWrap.toggleClass('cs-hide', key !== 'after');
+        this.refresh();
+      };
+      return b;
+    };
+    const bClock = mkMode('clock', 'в какое время');
+    const bAfter = mkMode('after', 'через сколько');
+    bClock.addClass('cs-mode-on');
 
-    const whenInput = contentEl.createEl('input', { cls: 'cs-when', type: 'text' });
-    whenInput.value = this.whenRaw;
-    whenInput.placeholder = 'через 30 минут / сегодня 18:00 / завтра 9:00 / 24.09 18:30';
-    whenInput.oninput = () => { this.whenRaw = whenInput.value; this.refresh(); };
+    // ── Колёса ──
+    const now = new Date();
+    this.hh = (now.getHours() + 1) % 24;
+    this.mm = 0;
+
+    const clockWrap = contentEl.createDiv({ cls: 'cs-wheels' });
+    this.wClockH = makeWheel(clockWrap, range(24), this.hh, 'ч', v => { this.hh = v; this.whenRaw = ''; wordsInput.value = ''; this.refresh(); });
+    this.wClockM = makeWheel(clockWrap, range(60), this.mm, 'мин', v => { this.mm = v; this.whenRaw = ''; wordsInput.value = ''; this.refresh(); });
+
+    const afterWrap = contentEl.createDiv({ cls: 'cs-wheels cs-hide' });
+    this.wAfterH = makeWheel(afterWrap, range(24), this.ah, 'ч', v => { this.ah = v; this.whenRaw = ''; wordsInput.value = ''; this.refresh(); });
+    this.wAfterM = makeWheel(afterWrap, range(60), this.am, 'мин', v => { this.am = v; this.whenRaw = ''; wordsInput.value = ''; this.refresh(); });
 
     this.preview = contentEl.createDiv({ cls: 'cs-preview' });
-    this.warn = contentEl.createDiv({ cls: 'cs-warn' });
 
-    // Куда
-    const targetWrap = contentEl.createDiv({ cls: 'cs-target' });
-    targetWrap.createEl('span', { text: 'Куда положить: ' });
-    const sel = targetWrap.createEl('select');
-    sel.createEl('option', { text: 'в открытую вкладку', value: 'current' });
-    sel.createEl('option', { text: 'в новую вкладку', value: 'new' });
-    sel.value = this.target;
-    sel.onchange = () => { this.target = sel.value; };
-    targetWrap.createEl('div', {
-      cls: 'cs-hint',
-      text: 'Если в поле ввода будет черновик — сообщение само уйдёт в новую вкладку, набранное не пропадёт. Если Клодиан в этот момент занят, он поставит сообщение в очередь и ответит следом.',
+    // ── Словами (для «завтра», «26.09 18:30» и прочего) ──
+    const words = contentEl.createDiv({ cls: 'cs-words' });
+    words.createEl('span', { text: 'или словами: ', cls: 'cs-hint' });
+    const wordsInput = words.createEl('input', { cls: 'cs-when', type: 'text' });
+    wordsInput.placeholder = 'завтра 9:00 · через 3 дня · 26.09 18:30';
+    wordsInput.oninput = () => { this.whenRaw = wordsInput.value; this.refresh(); };
+    wordsInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); this.submit(); }
     });
 
-    // Кнопки
+    this.warn = contentEl.createDiv({ cls: 'cs-warn' });
+
+    // ── Куда положить ──
+    contentEl.createEl('label', { text: 'Куда положить', cls: 'cs-label' });
+    const sel = contentEl.createEl('select', { cls: 'cs-target-sel' });
+    this.tabs = this.plugin.tabs();
+    const many = this.tabs.some(t => t.win > 0);
+    this.tabs.forEach((t, i) => {
+      const where = many ? ` · окно ${t.win + 1}` : '';
+      const mark = t.active ? ' (открыта сейчас)' : '';
+      sel.createEl('option', { text: `в чат «${t.title}»${where}${mark}`, value: `tab:${i}` });
+    });
+    sel.createEl('option', { text: 'в тот чат, что будет открыт в это время', value: 'current' });
+    sel.createEl('option', { text: 'в новую вкладку', value: 'new' });
+
+    // по умолчанию — вкладка, открытая сейчас: это и есть «то окно, где я работаю»
+    const activeIdx = this.tabs.findIndex(t => t.active);
+    sel.value = this.pickInitialTarget(activeIdx);
+    this.applyTarget(sel.value);
+    sel.onchange = () => this.applyTarget(sel.value);
+
+    contentEl.createEl('div', {
+      cls: 'cs-hint',
+      text: 'Выбранный чат плагин сам сделает активным перед отправкой. Если в поле ввода будет черновик — сообщение уйдёт в новую вкладку, набранное не пропадёт. Если Клодиан занят, он поставит сообщение в очередь и ответит следом.',
+    });
+
+    // ── Кнопки ──
     const row = contentEl.createDiv({ cls: 'cs-row' });
     this.okBtn = row.createEl('button', { text: this.item ? 'Перенести' : 'Запланировать', cls: 'mod-cta' });
     this.okBtn.onclick = () => this.submit();
@@ -845,16 +1103,41 @@ class ComposeModal extends Modal {
     ta.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); this.submit(); }
     });
-    whenInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); this.submit(); }
-    });
 
     this.refresh();
     window.setTimeout(() => ta.focus(), 30);
   }
 
+  /** Что выбрать в списке «куда» при открытии окна. */
+  pickInitialTarget(activeIdx) {
+    const t = this.target;
+    if (t === 'new') return 'new';
+    if (t && typeof t === 'object' && t.title) {
+      const i = this.tabs.findIndex(x => x.title === t.title && x.win === t.win);
+      if (i >= 0) return `tab:${i}`;             // сохранённый чат ещё открыт
+    }
+    if (this.item) return 'current';             // перенос: чужой выбор молча не меняем
+    if (t === 'current') return 'current';
+    if (activeIdx >= 0) return `tab:${activeIdx}`; // по умолчанию — чат, открытый сейчас
+    return 'current';
+  }
+
+  applyTarget(value) {
+    if (value === 'new' || value === 'current') { this.target = value; return; }
+    const i = Number(String(value).split(':')[1]);
+    const t = this.tabs[i];
+    this.target = t ? { title: t.title, win: t.win, index: t.index } : 'current';
+  }
+
+  /** Время, которое сейчас выбрано: слова важнее колеса. */
+  chosen() {
+    if (String(this.whenRaw).trim()) return parseWhen(this.whenRaw);
+    if (this.mode === 'after') return wheelAfterAt(this.ah, this.am);
+    return wheelClockAt(this.hh, this.mm);
+  }
+
   refresh() {
-    const res = parseWhen(this.whenRaw);
+    const res = this.chosen();
     const okText = !!String(this.text).trim();
     if (res.error) {
       this.preview.setText(`⚠️ ${res.error}`);
@@ -875,7 +1158,7 @@ class ComposeModal extends Modal {
   async submit() {
     const text = String(this.text).trim();
     if (!text) { new Notice('Сначала напиши сообщение'); return; }
-    const res = parseWhen(this.whenRaw);
+    const res = this.chosen();
     if (res.error) { new Notice(`Время: ${res.error}`); return; }
 
     if (this.item) {
@@ -954,7 +1237,7 @@ class ListModal extends Modal {
         ? `${formatWhen(item.fireAt)} · ${humanLeft(item.fireAt)}`
         : `${formatWhen(item.sentAt || item.fireAt)}`,
     });
-    if (item.target === 'new') head.createEl('span', { cls: 'cs-hint', text: ' · в новую вкладку' });
+    head.createEl('span', { cls: 'cs-hint', text: ` · ${targetLabel(item.target)}` });
     el.createDiv({ cls: 'cs-item-text', text: shortText(item.text, 200) });
     if (item.note) el.createDiv({ cls: 'cs-hint', text: item.note });
 
@@ -1006,11 +1289,12 @@ class ScheduleSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Куда класть по умолчанию')
-      .setDesc('В окне создания это можно менять для каждого сообщения.')
+      .setDesc('В окне создания это можно менять для каждого сообщения — там же виден список открытых чатов.')
       .addDropdown(d => d
-        .addOption('current', 'в открытую вкладку')
+        .addOption('active', 'в тот чат, где я пишу сейчас')
+        .addOption('current', 'в тот, что будет открыт в момент отправки')
         .addOption('new', 'в новую вкладку')
-        .setValue(s.defaultTarget === 'new' ? 'new' : 'current')
+        .setValue(['active', 'current', 'new'].includes(s.defaultTarget) ? s.defaultTarget : 'active')
         .onChange(async v => { s.defaultTarget = v; await save(); }));
 
     new Setting(containerEl)
@@ -1051,4 +1335,6 @@ module.exports._internals = {
   parseWhen, formatWhen, humanLeft, decideOverdue, shortText, buildDate, num,
   activeInput, freeInput, tabOf, countUserMessages, queueText, sendOutcome,
   deliverText, isUsable, SEL, DEFAULTS, MAX_ATTEMPTS,
+  listTabs, matchTab, findDurableRecord, normalizeTarget, targetLabel,
+  wheelClockAt, wheelAfterAt, wheelIndexFromScroll, range,
 };

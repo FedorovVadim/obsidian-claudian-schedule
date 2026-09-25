@@ -4,7 +4,7 @@
   "description": "Отложенные сообщения Клодиану в Obsidian",
   "private": true,
   "scripts": {
-    "test": "node --check main.js && node test/when.test.js && node test/deliver.test.js && node test/overdue.test.js"
+    "test": "node --check main.js && node test/when.test.js && node test/deliver.test.js && node test/overdue.test.js && node test/durable.test.js"
   },
   "devDependencies": {
     "jsdom": "^27.0.0"

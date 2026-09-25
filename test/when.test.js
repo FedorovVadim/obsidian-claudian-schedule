@@ -203,5 +203,72 @@ t('shortText не рвёт короткое и обрезает длинное',
   assert.strictEqual(shortText('a'.repeat(100), 10).length, 10);
 });
 
+console.log('Колесо времени (как в часах на айфоне):');
+
+const { wheelClockAt, wheelAfterAt, wheelIndexFromScroll, range, normalizeTarget, targetLabel } = internals;
+
+t('выбрал 14:50, сейчас 14:30 — уйдёт сегодня в 14:50', () => {
+  const d = new Date(wheelClockAt(14, 50, NOW).at);
+  assert.strictEqual(d.getDate(), 24);
+  assert.strictEqual(d.getHours(), 14);
+  assert.strictEqual(d.getMinutes(), 50);
+});
+
+t('выбрал 9:00, сейчас 14:30 — уйдёт ЗАВТРА в 9:00, а не в прошлое', () => {
+  const d = new Date(wheelClockAt(9, 0, NOW).at);
+  assert.strictEqual(d.getDate(), 25);
+  assert.strictEqual(d.getHours(), 9);
+});
+
+t('выбрал 00:00 — это полночь следующего дня', () => {
+  const d = new Date(wheelClockAt(0, 0, NOW).at);
+  assert.strictEqual(d.getDate(), 25);
+  assert.strictEqual(d.getHours(), 0);
+});
+
+t('«через сколько»: 0 ч 50 мин — ровно пятьдесят минут', () => {
+  assert.strictEqual(wheelAfterAt(0, 50, NOW).at, NOW + 50 * 60000);
+});
+
+t('«через сколько»: 2 ч 5 мин', () => {
+  assert.strictEqual(wheelAfterAt(2, 5, NOW).at, NOW + 125 * 60000);
+});
+
+t('«через сколько»: 0 ч 0 мин — ошибка, а не отправка сию секунду', () => {
+  assert.ok(wheelAfterAt(0, 0, NOW).error);
+});
+
+t('деление колеса считается по прокрутке', () => {
+  assert.strictEqual(wheelIndexFromScroll(0, 34, 24), 0);
+  assert.strictEqual(wheelIndexFromScroll(34 * 3, 34, 24), 3);
+  assert.strictEqual(wheelIndexFromScroll(34 * 3 + 10, 34, 24), 3, 'ближе к третьему');
+  assert.strictEqual(wheelIndexFromScroll(34 * 3 + 25, 34, 24), 4, 'ближе к четвёртому');
+  assert.strictEqual(wheelIndexFromScroll(-50, 34, 24), 0, 'за край не уходим');
+  assert.strictEqual(wheelIndexFromScroll(99999, 34, 24), 23, 'и за другой край тоже');
+  assert.strictEqual(wheelIndexFromScroll('мусор', 34, 24), 0);
+});
+
+t('колёса показывают правильные наборы', () => {
+  assert.strictEqual(range(24).length, 24);
+  assert.strictEqual(range(60)[59], 59);
+});
+
+console.log('Куда класть сообщение:');
+
+t('выбор чата сохраняется, мусор превращается в «открытую вкладку»', () => {
+  assert.deepStrictEqual(
+    normalizeTarget({ title: 'BIORISE', win: 1, index: 2 }),
+    { title: 'BIORISE', win: 1, index: 2 });
+  assert.strictEqual(normalizeTarget('new'), 'new');
+  assert.strictEqual(normalizeTarget(undefined), 'current');
+  assert.strictEqual(normalizeTarget({ nothing: 1 }), 'current');
+});
+
+t('подпись выбора понятна человеку', () => {
+  assert.strictEqual(targetLabel({ title: 'BIORISE', win: 0, index: 0 }), 'в чат «BIORISE»');
+  assert.strictEqual(targetLabel('new'), 'в новую вкладку');
+  assert.strictEqual(targetLabel('current'), 'в открытую вкладку');
+});
+
 console.log(`\nВсего зелёных: ${passed}`);
 if (process.exitCode) { console.error('ЕСТЬ ПАДЕНИЯ'); } else { console.log('Все проверки прошли'); }

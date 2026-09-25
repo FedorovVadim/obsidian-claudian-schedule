@@ -18,6 +18,73 @@
 
 .cs-modal .cs-when { width: 100%; margin-top: 6px; }
 
+/* ── Колесо времени, как в часах на айфоне ───────────────────────────────── */
+
+.cs-modes { display: flex; gap: 6px; margin-bottom: 8px; }
+
+.cs-mode {
+  padding: 4px 14px;
+  border-radius: 14px;
+  font-size: var(--font-ui-small);
+  background: var(--background-modifier-hover);
+  border: 1px solid var(--background-modifier-border);
+  cursor: pointer;
+}
+.cs-mode.cs-mode-on {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+
+.cs-hide { display: none !important; }
+
+.cs-wheels {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 0;
+}
+
+.cs-wheel { display: flex; align-items: center; gap: 6px; }
+
+.cs-wheel-scroll {
+  height: 170px;           /* пять строк по 34 точки */
+  width: 78px;
+  overflow-y: scroll;
+  scroll-snap-type: y mandatory;
+  scrollbar-width: none;
+  border-radius: 10px;
+  background: var(--background-secondary);
+}
+.cs-wheel-scroll::-webkit-scrollbar { display: none; }
+
+.cs-wheel-pad { height: 68px; }  /* две строки сверху и снизу, чтобы край вставал в центр */
+
+.cs-wheel-item {
+  height: 34px;
+  line-height: 34px;
+  text-align: center;
+  scroll-snap-align: center;
+  font-size: 20px;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 8px;
+  transition: color 80ms ease, background 80ms ease;
+}
+.cs-wheel-item.cs-wheel-on {
+  background: var(--background-modifier-hover);
+  color: var(--text-normal);
+  font-weight: 600;
+}
+
+.cs-wheel-label { font-size: var(--font-ui-smaller); color: var(--text-muted); }
+
+.cs-words { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.cs-words .cs-when { flex: 1; margin-top: 0; }
+
+.cs-target-sel { width: 100%; margin-bottom: 4px; }
+
 .cs-quick { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .cs-chip {

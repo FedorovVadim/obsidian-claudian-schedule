@@ -28,6 +28,8 @@ function makeClaudian(opts = {}) {
     canNewTab = true,       // команда новой вкладки работает (у Клодиана есть предел вкладок)
     popout = false,         // второе окно Обсидиана (оторванное)
     deaf = false,           // Клодиан вообще не реагирует на Enter
+    background = false,     // окно Обсидиана в фоне: сообщение принято, но на экране ещё не нарисовано
+    titles = null,          // названия вкладок для полоски значков
   } = opts;
 
   const dom = new JSDOM('<!doctype html><html><body></body></html>');
@@ -37,6 +39,7 @@ function makeClaudian(opts = {}) {
 
   const calls = [];
   const presses = [];
+  const accepted = [];   // что Клодиан принял на самом деле (заменяет запись на диск)
   let sleeps = 0;
   const pending = [];        // отложенная доставка: {atSleep, fn}
 
@@ -44,11 +47,14 @@ function makeClaudian(opts = {}) {
     const leaf = targetDoc.createElement('div');
     leaf.className = 'workspace-leaf-content';
     leaf.setAttribute('data-type', 'claudian-view');
+    const badges = targetDoc.createElement('div');
+    badges.className = 'claudian-tab-badges';
+    leaf.appendChild(badges);
     const container = targetDoc.createElement('div');
     container.className = 'claudian-tab-content-container';
     leaf.appendChild(container);
     targetDoc.body.appendChild(leaf);
-    return { leaf, container };
+    return { leaf, container, badges };
   }
 
   const leaves = [];
@@ -76,6 +82,26 @@ function makeClaudian(opts = {}) {
     tab.append(messages, queue, toolbar, ta);
     holder.container.appendChild(tab);
 
+    // значок вкладки: название в aria-label, щелчок переключает (renderBadge Клодиана)
+    const title = (titles && titles[holder.badges.childElementCount]) || `Чат ${holder.badges.childElementCount + 1}`;
+    const badge = d.createElement('div');
+    badge.className = 'claudian-tab-badge claudian-tab-badge-active';
+    badge.setAttribute('aria-label', `${title}, активна`);
+    badge.textContent = String(holder.badges.childElementCount + 1);
+    Array.from(holder.badges.children).forEach(b => {
+      b.className = 'claudian-tab-badge claudian-tab-badge-idle';
+      b.setAttribute('aria-label', (b.getAttribute('aria-label') || '').replace(', активна', ', ждёт'));
+    });
+    holder.badges.appendChild(badge);
+    badge.addEventListener('click', () => {
+      Array.from(holder.badges.children).forEach((b, i) => {
+        const on = b === badge;
+        b.className = 'claudian-tab-badge ' + (on ? 'claudian-tab-badge-active' : 'claudian-tab-badge-idle');
+        const tabs = holder.container.querySelectorAll('.claudian-tab-content');
+        if (tabs[i]) tabs[i].classList.toggle('claudian-hidden', !on);
+      });
+    });
+
     ta.addEventListener('keydown', (e) => {
       if (e.key !== 'Enter' || deaf) return;
       // настоящее условие Клодиана: при выключенной настройке проходит любое нажатие
@@ -86,6 +112,12 @@ function makeClaudian(opts = {}) {
       presses.push(text);
       const deliver = () => {
         ta.value = '';
+        accepted.push({ text, at: Date.now() });
+        if (background) {
+          // окно в фоне: Клодиан сообщение принял (запись на диске есть),
+          // а нарисует его на экране позже — ровно случай 25.09.2026
+          return;
+        }
         if (busy) {
           // занятый агент: сообщение уходит в очередь, в переписке пока не появляется
           queue.textContent = `⌙ Queued: ${text}`;
@@ -128,6 +160,11 @@ function makeClaudian(opts = {}) {
         if (pending[i].atSleep <= sleeps) { pending[i].fn(); pending.splice(i, 1); }
       }
     },
+    // «запись на диске»: у настоящего Клодиана это .claudian/sessions/*.inputs.json
+    durable: async (text, since) => {
+      const hit = accepted.find(a => a.text === text && a.at >= since);
+      return hit ? { where: 'conv-тест' } : null;
+    },
     requireMod: false,     // плагин по умолчанию не знает настройку
     modKnown: false,
     isMac: true,
@@ -136,7 +173,7 @@ function makeClaudian(opts = {}) {
 
   return {
     dom, doc, doc2, env, calls, tabs, leaves, addTab,
-    presses,
+    presses, accepted,
     userTexts: () => [
       ...Array.from(doc.querySelectorAll('[data-role="user"]')).map(e => e.textContent),
       ...(doc2 ? Array.from(doc2.querySelectorAll('[data-role="user"]')).map(e => e.textContent) : []),
