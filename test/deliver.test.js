@@ -177,6 +177,14 @@ async function t(name, fn) {
     assert.strictEqual(c.accepted.length, 0);
   });
 
+  await t('принято, но ни на экране, ни в поле следов нет — спасает только запись на диске', async () => {
+    const c = makeClaudian({ background: true, keepField: true });
+    const res = await deliverText(c.env, 'самый глухой случай', 'current');
+    assert.strictEqual(res.ok, true, `запись на диске есть, значит это успех: ${res.reason}`);
+    assert.ok(/принято Клодианом/.test(res.note), `получено: ${res.note}`);
+    assert.deepStrictEqual(c.userTexts(), [], 'на экране пусто');
+  });
+
   console.log('Выбор чата, куда положить:');
 
   await t('сообщение уходит в ВЫБРАННЫЙ чат, даже если открыт другой', async () => {

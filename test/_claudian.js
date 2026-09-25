@@ -29,6 +29,7 @@ function makeClaudian(opts = {}) {
     popout = false,         // второе окно Обсидиана (оторванное)
     deaf = false,           // Клодиан вообще не реагирует на Enter
     background = false,     // окно Обсидиана в фоне: сообщение принято, но на экране ещё не нарисовано
+    keepField = false,      // худший случай: принято, но и поле ввода очистится позже
     titles = null,          // названия вкладок для полоски значков
   } = opts;
 
@@ -111,7 +112,7 @@ function makeClaudian(opts = {}) {
       if (!text.trim()) return;
       presses.push(text);
       const deliver = () => {
-        ta.value = '';
+        if (!keepField) ta.value = '';
         accepted.push({ text, at: Date.now() });
         if (background) {
           // окно в фоне: Клодиан сообщение принял (запись на диске есть),
