@@ -31,6 +31,11 @@ function makeClaudian(opts = {}) {
     background = false,     // окно Обсидиана в фоне: сообщение принято, но на экране ещё не нарисовано
     keepField = false,      // худший случай: принято, но и поле ввода очистится позже
     titles = null,          // названия вкладок для полоски значков
+    // 'textarea' — Клодиан до 2.3.39; 'div' — 2.3.39+ (сверено с 2.3.48 25.11.2026):
+    // поле — DIV.claudian-input.claudian-composer-editor, value объявлен свойством
+    // (Object.defineProperties), keydown слушается на этом же DIV с перехватом,
+    // очередь — span.claudian-queue-indicator-text, старой .claudian-input-queue-row нет.
+    composer = 'textarea',
   } = opts;
 
   const dom = new JSDOM('<!doctype html><html><body></body></html>');
@@ -74,13 +79,35 @@ function makeClaudian(opts = {}) {
     tab.className = 'claudian-tab-content';
     const messages = d.createElement('div');
     messages.className = 'claudian-messages';
-    const queue = d.createElement('div');
-    queue.className = 'claudian-input-queue-row';
+    let queue;
+    let queueBox;
+    if (composer === 'div') {
+      queueBox = d.createElement('div');
+      queueBox.className = 'claudian-queue-indicator';
+      queue = d.createElement('span');
+      queue.className = 'claudian-queue-indicator-text';
+      queueBox.appendChild(queue);
+    } else {
+      queue = d.createElement('div');
+      queue.className = 'claudian-input-queue-row';
+      queueBox = queue;
+    }
     const toolbar = d.createElement('div');
     toolbar.className = 'claudian-input-toolbar';
-    const ta = d.createElement('textarea');
-    ta.className = 'claudian-input';
-    tab.append(messages, queue, toolbar, ta);
+    let ta;
+    if (composer === 'div') {
+      ta = d.createElement('div');
+      ta.className = 'claudian-input claudian-composer-editor';
+      ta.setAttribute('role', 'textbox');
+      ta.setAttribute('tabindex', '0');
+      let doc = '';
+      // как в Клодиане: value — свойство внешнего DIV, внутренний редактор не нужен
+      Object.defineProperties(ta, { value: { get: () => doc, set: (s) => { doc = String(s); } } });
+    } else {
+      ta = d.createElement('textarea');
+      ta.className = 'claudian-input';
+    }
+    tab.append(messages, queueBox, toolbar, ta);
     holder.container.appendChild(tab);
 
     // значок вкладки: название в aria-label, щелчок переключает (renderBadge Клодиана)
@@ -104,7 +131,7 @@ function makeClaudian(opts = {}) {
     });
 
     ta.addEventListener('keydown', (e) => {
-      if (e.key !== 'Enter' || deaf) return;
+      if (e.key !== 'Enter' || e.shiftKey || deaf) return;
       // настоящее условие Клодиана: при выключенной настройке проходит любое нажатие
       const modOk = requireMod ? (e.metaKey || e.ctrlKey) : true;
       if (!modOk) return;
@@ -132,7 +159,7 @@ function makeClaudian(opts = {}) {
       };
       if (sendDelay > 0) pending.push({ atSleep: sleeps + sendDelay, fn: deliver });
       else deliver();
-    });
+    }, composer === 'div');   // у DIV Клодиан 2.3.48 слушает с перехватом (addEventListener(..., !0))
     return { tab, ta, messages, queue, toolbar };
   }
 
@@ -179,7 +206,7 @@ function makeClaudian(opts = {}) {
       ...Array.from(doc.querySelectorAll('[data-role="user"]')).map(e => e.textContent),
       ...(doc2 ? Array.from(doc2.querySelectorAll('[data-role="user"]')).map(e => e.textContent) : []),
     ],
-    queueTexts: () => Array.from(doc.querySelectorAll('.claudian-input-queue-row'))
+    queueTexts: () => Array.from(doc.querySelectorAll('.claudian-input-queue-row, .claudian-queue-indicator-text'))
       .map(e => e.textContent).filter(Boolean),
   };
 }

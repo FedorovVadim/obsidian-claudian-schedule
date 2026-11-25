@@ -6,13 +6,18 @@
  * Что делает: ты пишешь сообщение сейчас и указываешь время. В назначенный час
  * плагин сам кладёт его в чат Клодиана и отправляет — как будто ты набрал и нажал Enter.
  *
- * Стык с Клодианом (проверено по сборке 2.2.6, 24.09.2026):
+ * Стык с Клодианом (2.2.6 — 24.09.2026; пересверено по 2.3.48 — 25.11.2026):
  *   - окна:        app.workspace.getLeavesOfType('claudian-view') — включая оторванные окна
  *   - вкладка:     .claudian-tab-content (неактивные скрыты классом .claudian-hidden)
- *   - поле ввода:  textarea.claudian-input внутри вкладки
+ *   - поле ввода:  .claudian-input внутри вкладки. До 2.3.39 это textarea, с 2.3.39 — DIV
+ *                  с редактором внутри; Клодиан оставил на нём свойство value и слушает
+ *                  keydown на нём же (с перехватом), поэтому вставка и Enter работают как раньше
  *   - переписка:   [data-role="user"] (класс .claudian-message-user оставлен запасным)
- *   - очередь:     .claudian-input-queue-row — «⌙ Queued: …», когда агент занят
- *   - команды:     <id>:open-view, <id>:new-tab, где id ищется среди зарегистрированных
+ *   - очередь:     .claudian-input-queue-row (до 2.3.39) или .claudian-queue-indicator-text
+ *   - команды:     <id>:new-tab; открыть окно — revealLeaf, а не open-view: с 2.3.x
+ *                  open-view стал переключателем и прячет уже открытое окно
+ *   - «принято»:   журнал сессии Claude Code (~/.claude/projects/<хранилище>/*.jsonl);
+ *                  прежние записи .claudian/sessions/*.inputs.json Клодиан с 14.11.2026 не ведёт
  *
  * Чего здесь НЕТ и почему: ожидания занятого агента. Клодиан сам ставит сообщение
  * в очередь, если в этот момент пишет ответ, и показывает это строкой «⌙ Queued».
@@ -262,9 +267,10 @@ const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
 const SEL = {
   leaf: '.workspace-leaf-content[data-type="claudian-view"]',
   tab: '.claudian-tab-content',
-  input: 'textarea.claudian-input',
+  // Без привязки к тегу: в Клодиане 2.3.39+ поле ввода — DIV с совместимым value
+  input: '.claudian-input',
   userMsg: '[data-role="user"], .claudian-message-user',
-  queue: '.claudian-input-queue-row',
+  queue: '.claudian-input-queue-row, .claudian-queue-indicator-text',
   toolbar: '.claudian-input-toolbar',
   badge: '.claudian-tab-badge',
   badgeActive: 'claudian-tab-badge-active',
@@ -337,9 +343,17 @@ function collect(roots, selector) {
   return out;
 }
 
+/**
+ * Годится ли элемент как поле ввода: виден и умеет value (textarea — да; DIV Клодиана
+ * 2.3.39+ — да, свойство он объявляет сам). Внутренний редактор не трогаем.
+ */
+function isComposer(el) {
+  return !!el && typeof el.value === 'string' && isUsable(el);
+}
+
 /** Поле ввода активной вкладки Клодиана. */
 function activeInput(roots) {
-  for (const el of collect(roots, SEL.input)) if (isUsable(el)) return el;
+  for (const el of collect(roots, SEL.input)) if (isComposer(el)) return el;
   return null;
 }
 
@@ -350,7 +364,7 @@ function activeInput(roots) {
  */
 function freeInput(roots) {
   const list = collect(roots, SEL.input).reverse();
-  for (const el of list) if (isUsable(el) && !(el.value || '').trim()) return el;
+  for (const el of list) if (isComposer(el) && !(el.value || '').trim()) return el;
   return null;
 }
 
@@ -367,8 +381,8 @@ function countUserMessages(input) {
 
 function queueText(input) {
   const tab = tabOf(input);
-  const q = tab && tab.querySelector(SEL.queue);
-  return q ? norm(q.textContent) : '';
+  if (!tab) return '';
+  return norm(Array.from(tab.querySelectorAll(SEL.queue)).map(q => q.textContent || '').join(' '));
 }
 
 /**
@@ -559,6 +573,59 @@ function findDurableRecord(fsMod, pathMod, sessionsDir, text, sinceMs) {
     } catch (e) { /* испорченный или занятый файл — просто пропускаем */ }
   }
   return null;
+}
+
+/** Текст сообщения владельца из строки журнала Claude Code: строка или список частей. */
+function userTextOf(message) {
+  const c = message && message.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.filter(x => x && x.type === 'text').map(x => x.text || '').join(' ');
+  return '';
+}
+
+/**
+ * Принял ли Claude Code сообщение — по журналу сессии (~/.claude/projects/<хранилище>/*.jsonl).
+ * С 14.11.2026 Клодиан не ведёт .claudian/sessions/*.inputs.json, а журнал сессии пишется
+ * при каждом сообщении. Клодиан дописывает к тексту служебные пометки, поэтому сравниваем
+ * начало, а не весь текст. Служебные строки (isMeta) и старые записи не считаются.
+ * Читаем только хвост файла: журналы бывают по сотне мегабайт.
+ */
+function findClaudeSessionRecord(fsMod, pathMod, projectDir, text, sinceMs, tailBytes = 1024 * 1024) {
+  const want = norm(text);
+  if (!want) return null;
+  let files;
+  try { files = fsMod.readdirSync(projectDir); } catch (e) { return null; }
+  for (const name of files) {
+    if (!name.endsWith('.jsonl')) continue;
+    const full = pathMod.join(projectDir, name);
+    try {
+      const st = fsMod.statSync(full);
+      if (st.mtimeMs < sinceMs) continue;
+      const len = Math.min(st.size, tailBytes);
+      const buf = Buffer.alloc(len);
+      const fd = fsMod.openSync(full, 'r');
+      try { fsMod.readSync(fd, buf, 0, len, st.size - len); } finally { fsMod.closeSync(fd); }
+      const lines = buf.toString('utf8').split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!line.includes('"type":"user"')) continue;
+        let rec;
+        try { rec = JSON.parse(line); } catch (e) { continue; }  // первая строка хвоста обычно обрезана
+        if (rec.type !== 'user' || rec.isMeta) continue;
+        const at = Date.parse(rec.timestamp || '');
+        if (!(at >= sinceMs)) continue;
+        if (norm(userTextOf(rec.message)).startsWith(want)) {
+          return { where: rec.sessionId || name.replace(/\.jsonl$/, ''), timestamp: at, state: 'accepted' };
+        }
+      }
+    } catch (e) { /* занятый или испорченный файл — пропускаем */ }
+  }
+  return null;
+}
+
+/** Папка журналов Claude Code для хранилища: путь, где всё, кроме букв и цифр, заменено на «-». */
+function claudeProjectDir(pathMod, homeDir, vaultPath) {
+  return pathMod.join(homeDir, '.claude', 'projects', String(vaultPath).replace(/[^A-Za-z0-9]/g, '-'));
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -805,6 +872,14 @@ class ClaudianSchedulePlugin extends Plugin {
    * Возвращает false, если команда не найдена или отказалась выполняться.
    */
   runClaudianCommand(suffix) {
+    // open-view в Клодиане 2.3.x — переключатель: на уже открытом окне он его прячет.
+    // Открытое окно раскрываем штатно, команду зовём только если окна нет совсем.
+    if (suffix === 'open-view') {
+      try {
+        const leaves = this.app.workspace.getLeavesOfType('claudian-view') || [];
+        if (leaves.length) { this.app.workspace.revealLeaf(leaves[0]); return true; }
+      } catch (e) { /* ниже — прежний путь через команду */ }
+    }
     try {
       const all = this.app.commands.commands || {};
       const id = [`realclaudian:${suffix}`, `claudian:${suffix}`].find(x => all[x])
@@ -841,8 +916,10 @@ class ClaudianSchedulePlugin extends Plugin {
     try {
       const fs = require('fs');
       const path = require('path');
-      const dir = path.join(this.app.vault.adapter.getBasePath(), '.claudian', 'sessions');
-      return findDurableRecord(fs, path, dir, text, since);
+      const os = require('os');
+      const base = this.app.vault.adapter.getBasePath();
+      return findDurableRecord(fs, path, path.join(base, '.claudian', 'sessions'), text, since)
+        || findClaudeSessionRecord(fs, path, claudeProjectDir(path, os.homedir(), base), text, since);
     } catch (e) {
       return null;
     }
@@ -1334,7 +1411,8 @@ module.exports = ClaudianSchedulePlugin;
 module.exports._internals = {
   parseWhen, formatWhen, humanLeft, decideOverdue, shortText, buildDate, num,
   activeInput, freeInput, tabOf, countUserMessages, queueText, sendOutcome,
-  deliverText, isUsable, SEL, DEFAULTS, MAX_ATTEMPTS,
-  listTabs, matchTab, findDurableRecord, normalizeTarget, targetLabel,
+  deliverText, isUsable, isComposer, SEL, DEFAULTS, MAX_ATTEMPTS,
+  listTabs, matchTab, findDurableRecord, findClaudeSessionRecord, claudeProjectDir, userTextOf,
+  normalizeTarget, targetLabel,
   wheelClockAt, wheelAfterAt, wheelIndexFromScroll, range,
 };
