@@ -243,6 +243,27 @@ function normalizeTarget(target) {
   return 'current';
 }
 
+/**
+ * Что выбрать в «Куда положить» при открытии окна.
+ * Новое сообщение — ВСЕГДА чат, открытый сейчас, в том окне Клодиана, откуда позвали
+ * (решение владельца 26.11.2026). Настройка «куда по умолчанию» действует, только если
+ * открытого чата нет. Перенос: сохранённый выбор не меняем.
+ */
+function initialTarget(tabs, saved, isReschedule, win) {
+  tabs = tabs || [];
+  if (isReschedule) {
+    if (saved && typeof saved === 'object' && saved.title) {
+      const i = tabs.findIndex(x => x.title === saved.title && x.win === saved.win);
+      if (i >= 0) return `tab:${i}`;
+    }
+    return saved === 'new' ? 'new' : 'current';
+  }
+  let i = (typeof win === 'number' && win >= 0) ? tabs.findIndex(t => t.active && t.win === win) : -1;
+  if (i < 0) i = tabs.findIndex(t => t.active);
+  if (i >= 0) return `tab:${i}`;
+  return saved === 'new' ? 'new' : 'current';
+}
+
 /** Как показать выбор человеку. */
 function targetLabel(target) {
   if (target === 'new') return 'в новую вкладку';
@@ -963,17 +984,35 @@ class ClaudianSchedulePlugin extends Plugin {
   }
 
   composeFromInput() {
-    const input = activeInput(this.claudianRoots());
+    const roots = this.claudianRoots();
+    const input = activeInput(roots);
     const text = input ? input.value : '';
+    const win = input ? roots.findIndex(r => r && r.contains && r.contains(input)) : -1;
     this.openComposer(text, () => {
       if (!input) return;
       input.value = '';
       fireInput(input);
-    });
+    }, win);
   }
 
-  openComposer(text, onScheduled) {
-    new ComposeModal(this.app, this, { text: text || '', onScheduled }).open();
+  openComposer(text, onScheduled, win) {
+    if (typeof win !== 'number' || win < 0) win = this.focusedWin();
+    new ComposeModal(this.app, this, { text: text || '', onScheduled, win }).open();
+  }
+
+  /** Окно Клодиана, в котором владелец сейчас работает; -1 — не определили. */
+  focusedWin() {
+    const roots = this.claudianRoots();
+    try {
+      const leaf = this.app.workspace.activeLeaf;
+      const el = leaf && leaf.view && leaf.view.containerEl;
+      const i = el ? roots.indexOf(el) : -1;
+      if (i >= 0) return i;
+    } catch (e) { /* ниже — по фокусу */ }
+    try {
+      const ae = document.activeElement;
+      return roots.findIndex(r => r && r.contains && ae && r.contains(ae));
+    } catch (e) { return -1; }
   }
 
   // ── Журнал ───────────────────────────────────────────────────────────────
@@ -1081,6 +1120,7 @@ class ComposeModal extends Modal {
     this.whenRaw = '';                // если написано словами — оно главнее колеса
     this.tabs = [];
     this.target = this.item ? this.item.target : plugin.settings.defaultTarget;
+    this.win = typeof opts.win === 'number' ? opts.win : -1;   // окно Клодиана, откуда позвали
     this.onScheduled = opts.onScheduled;
     this.onDone = opts.onDone;
   }
@@ -1160,8 +1200,7 @@ class ComposeModal extends Modal {
     sel.createEl('option', { text: 'в новую вкладку', value: 'new' });
 
     // по умолчанию — вкладка, открытая сейчас: это и есть «то окно, где я работаю»
-    const activeIdx = this.tabs.findIndex(t => t.active);
-    sel.value = this.pickInitialTarget(activeIdx);
+    sel.value = this.pickInitialTarget();
     this.applyTarget(sel.value);
     sel.onchange = () => this.applyTarget(sel.value);
 
@@ -1186,17 +1225,8 @@ class ComposeModal extends Modal {
   }
 
   /** Что выбрать в списке «куда» при открытии окна. */
-  pickInitialTarget(activeIdx) {
-    const t = this.target;
-    if (t === 'new') return 'new';
-    if (t && typeof t === 'object' && t.title) {
-      const i = this.tabs.findIndex(x => x.title === t.title && x.win === t.win);
-      if (i >= 0) return `tab:${i}`;             // сохранённый чат ещё открыт
-    }
-    if (this.item) return 'current';             // перенос: чужой выбор молча не меняем
-    if (t === 'current') return 'current';
-    if (activeIdx >= 0) return `tab:${activeIdx}`; // по умолчанию — чат, открытый сейчас
-    return 'current';
+  pickInitialTarget() {
+    return initialTarget(this.tabs, this.target, !!this.item, this.win);
   }
 
   applyTarget(value) {
@@ -1365,13 +1395,12 @@ class ScheduleSettingsTab extends PluginSettingTab {
         .onChange(async v => { s.graceHours = v; await save(); }));
 
     new Setting(containerEl)
-      .setName('Куда класть по умолчанию')
-      .setDesc('В окне создания это можно менять для каждого сообщения — там же виден список открытых чатов.')
+      .setName('Куда класть, если открытого чата нет')
+      .setDesc('Новое сообщение всегда ставится в чат, открытый сейчас; в окне создания выбор можно поменять.')
       .addDropdown(d => d
-        .addOption('active', 'в тот чат, где я пишу сейчас')
         .addOption('current', 'в тот, что будет открыт в момент отправки')
         .addOption('new', 'в новую вкладку')
-        .setValue(['active', 'current', 'new'].includes(s.defaultTarget) ? s.defaultTarget : 'active')
+        .setValue(s.defaultTarget === 'new' ? 'new' : 'current')
         .onChange(async v => { s.defaultTarget = v; await save(); }));
 
     new Setting(containerEl)
@@ -1413,6 +1442,6 @@ module.exports._internals = {
   activeInput, freeInput, tabOf, countUserMessages, queueText, sendOutcome,
   deliverText, isUsable, isComposer, SEL, DEFAULTS, MAX_ATTEMPTS,
   listTabs, matchTab, findDurableRecord, findClaudeSessionRecord, claudeProjectDir, userTextOf,
-  normalizeTarget, targetLabel,
+  normalizeTarget, targetLabel, initialTarget,
   wheelClockAt, wheelAfterAt, wheelIndexFromScroll, range,
 };
